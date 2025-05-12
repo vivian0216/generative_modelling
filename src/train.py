@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-verbose_interval = 250
+verbose_interval = 99
 
 def train(model: nn.Module,
           dataset: torch.utils.data.Dataset,
@@ -27,7 +27,7 @@ def train(model: nn.Module,
     buffer = []
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion_clf = torch.nn.CrossEntropyLoss()
+    criterion_clf = torch.nn.CrossEntropyLoss(reduction='sum')
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size)
 
     model.to(device)
@@ -66,7 +66,7 @@ def train(model: nn.Module,
                 logsumexp = torch.logsumexp(xt_logits, dim=-1)
                 
                 # compute gradients
-                logsumexp.backward()
+                logsumexp.sum().backward()
                 grad = xt.grad
 
                 # do step manually
@@ -75,8 +75,8 @@ def train(model: nn.Module,
 
             # # get generation loss
             xt_logits = model(xt.to(device))
-            loss_gen = torch.logsumexp(x_logits, dim=-1) - torch.logsumexp(xt_logits, dim=-1)
-            loss = loss_clf + gen_weight * loss_gen
+            loss_gen = torch.logsumexp(xt_logits, dim=-1) - torch.logsumexp(x_logits, dim=-1)
+            loss = loss_clf + gen_weight * loss_gen.sum()
 
             # do model step using optimizer
             optimizer.zero_grad()
@@ -180,9 +180,9 @@ if __name__ == "__main__":
         steps = 20,
         reinit_freq = 0.05,
         epochs = 10,
-        batch_size = 1,
+        batch_size = 30,
         learning_rate = 0.001,
-        gen_weight = 0,
+        gen_weight = 1,
         learning_rate_decay = None,
         learning_rate_epochs = None,
         train_fraction = 0.05,
