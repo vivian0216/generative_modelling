@@ -70,7 +70,10 @@ def train(model: nn.Module,
                     # get a new sample in range [-1, 1)
                     xt[i] = torch.rand(x.shape[1:]) * 2 - 1
                 else:
-                    xt[i] = random.choice(random.choice(buffer))
+                    batch = random.choice(buffer)
+                    i = np.random.randint(batch.shape[0])
+                    xt[i] = batch[i]
+                    # xt[i] = random.choice(random.choice(buffer))
 
             # perform SGLD
             for t in range(steps):
@@ -107,7 +110,7 @@ def train(model: nn.Module,
             optimizer.step()
 
             # add xt to buffer
-            buffer.append(xt)
+            buffer.append(xt.cpu().detach())
             if len(buffer) > (buffer_size / batch_size):
                 buffer = buffer[1:]
 
