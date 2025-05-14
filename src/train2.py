@@ -101,19 +101,31 @@ def train(model: nn.Module,
             # perform SGLD with gradient clipping to prevent explosions
             for t in range(steps):
                 xt = xt.clone().detach().requires_grad_(True).to(device)
-                xt.retain_grad()
                 xt_logits = model(xt)
                 logsumexp = torch.logsumexp(xt_logits, dim=-1)
                 
                 # compute gradients
                 logsumexp.sum().backward()
                 
-                # Clip gradients to prevent extreme values
+                # Clip gradients to prevent extreme values - FIX APPLIED HERE
                 grad = xt.grad
-                grad_norm = torch.norm(grad, dim=1, keepdim=True)
+                
+                # Calculate the norm properly across all dimensions except batch
+                # For CIFAR (B, 3, 32, 32) or MNIST (B, 1, 28, 28)
+                grad_norm = torch.norm(grad.view(grad.shape[0], -1), dim=1)
+                
+                # Reshape gradient norm to match batch dimension for comparison
+                grad_norm = grad_norm.view(grad.shape[0], 1, 1, 1)
+                
+                # Create the mask for values that are too large
                 too_large = grad_norm > 10.0
+                
+                # Apply the mask and rescale gradients
                 if too_large.any():
-                    grad[too_large] = grad[too_large] / grad_norm[too_large] * 10.0
+                    # The mask broadcasting will now work correctly
+                    scale_factor = 10.0 / grad_norm
+                    scale_factor[~too_large] = 1.0
+                    grad = grad * scale_factor
 
                 # do step manually with gradient clipping
                 with torch.no_grad():
