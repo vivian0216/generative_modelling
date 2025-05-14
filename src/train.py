@@ -39,6 +39,11 @@ def train(model: nn.Module,
     model.to(device)
     e = 0 
     while e < epochs:
+        # decrease step size with every epoch since in the beginning the landscape is very bad
+        step_size = step_size/(e+1)
+        # make more steps later in the training
+        steps = steps + e
+
         clf_losses = []
         gen_losses = []
         combined_losses = []
@@ -237,7 +242,7 @@ if __name__ == "__main__":
     # model = WideResNet(out_dim)
 
     cfg = dict(
-        step_size = 1, 
+        step_size = 0.5, 
         noise = 0.01, 
         buffer_size = 1000,
         steps = 20,
