@@ -60,11 +60,13 @@ def train(model: nn.Module,
             loss_clf = criterion_clf(x_logits, y)
 
             # # sample starting x from buffer
-            if len(buffer) == 0 or np.random.random() < reinit_freq:
-                # get a new sample in range [-1, 1)
-                xt = torch.rand(x.shape) * 2 - 1
-            else:
-                xt = random.choice(buffer)
+            xt = torch.empty_like(x)
+            for i in range(x.shape[0]):
+                if len(buffer) == 0 or np.random.random() < reinit_freq:
+                    # get a new sample in range [-1, 1)
+                    xt[i] = torch.rand(x.shape[1:]) * 2 - 1
+                else:
+                    xt[i] = random.choice(random.choice(buffer))
 
             # perform SGLD
             for t in range(steps):
@@ -102,7 +104,7 @@ def train(model: nn.Module,
 
             # add xt to buffer
             buffer.append(xt)
-            if len(buffer) > buffer_size:
+            if len(buffer) > (buffer_size / batch_size):
                 buffer = buffer[1:]
 
             # add metrics
@@ -149,6 +151,9 @@ def train(model: nn.Module,
             'Training/loss_clf': np.mean(clf_losses),
             'Training/loss_gen': np.mean(gen_losses),
             'Training/loss': np.mean(combined_losses),
+            'Training/acc': np.mean(accs),
+            'Training/energy_real': np.mean(energies_real),
+            'Training/energy_fake': np.mean(energies_fake),
             'epoch': e
         })
 
@@ -181,30 +186,45 @@ class CNN(nn.Module):
         x = self.fc2(x)
         return x
 
+class WideResNet(nn.Module):
+    def __init__(self, out_dim):
+        super(WideResNet, self).__init__()
+        self.model = models.wide_resnet50_2(pretrained=True)
+        self.model.fc = nn.Linear(self.model.fc.in_features, out_dim)
+
+    def forward(self, x):
+        return self.model(x)
+
 if __name__ == "__main__":
 
-    from torchvision.datasets import MNIST
+    from torchvision.datasets import MNIST, CIFAR10
     from torchvision import transforms
     from torchvision import models
 
-    # Get only a fraction of the dataset
     full_dataset = MNIST(root='./data', train=True, download=True, transform=transforms.Compose([
         transforms.ToTensor(),
         transforms.Lambda(lambda x: x * 2 - 1)
     ]))
 
+    # full_dataset = CIFAR10(root='./data', train=True, download=True, transform=transforms.Compose([
+    #     transforms.ToTensor(),
+    #     transforms.Lambda(lambda x: x * 2 - 1)
+    # ]))
+
+
     out_dim = 10
-    model = CNN(out_dim)
+    model = CNN(out_dim) 
+    # model = WideResNet(out_dim)
 
     cfg = dict(
         step_size = 1, 
         noise = 0.01, 
-        buffer_size = 10000,
+        buffer_size = 1000,
         steps = 20,
         reinit_freq = 0.05,
-        epochs = 10,
-        batch_size = 30,
-        learning_rate = 0.001,
+        epochs = 50,
+        batch_size = 60,
+        learning_rate = 1e-4,
         gen_weight = 1,
         learning_rate_decay = None,
         learning_rate_epochs = None,
