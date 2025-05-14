@@ -9,10 +9,11 @@ import torch.nn.functional as F
 import os
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-verbose_interval = 99
+verbose_interval = None
 
 def train(model: nn.Module,
-          dataset: torch.utils.data.Dataset,
+          train_dataset: torch.utils.data.Dataset,
+          test_dataset: torch.utils.data.Dataset,
           step_size: float, 
           noise: float, 
           buffer_size: int,
@@ -23,14 +24,16 @@ def train(model: nn.Module,
           learning_rate: float,
           gen_weight: float,
           learning_rate_decay: float,
-          learning_rate_epochs: list[int],
+          learning_rate_epochs: int,
           model_dir: str = './models'):
     
     buffer = []
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion_clf = torch.nn.CrossEntropyLoss(reduction='sum')
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=learning_rate_epochs, gamma=learning_rate_decay)
+    criterion_clf = torch.nn.CrossEntropyLoss(reduction='mean')
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     os.makedirs(model_dir, exist_ok=True)
     model.to(device)
@@ -42,7 +45,7 @@ def train(model: nn.Module,
         accs = []
         energies_real = []
         energies_fake = []        
-        pbar = tqdm(dataloader, unit='batch', desc=f'Epoch {e+1}')
+        pbar = tqdm(train_dataloader, unit='batch', desc=f'Epoch {e+1}')
 
         # Save checkpoint
         model_path = f'{model_dir}/checkpoint.pth'
@@ -51,6 +54,7 @@ def train(model: nn.Module,
         
         verbose_counter = 0
 
+        # Train
         for x, y in pbar:
             x = x.to(device)
             y = y.to(device)
@@ -86,7 +90,7 @@ def train(model: nn.Module,
             # # get generation loss
             xt_logits = model(xt.to(device))
             loss_gen = torch.logsumexp(xt_logits, dim=-1) - torch.logsumexp(x_logits, dim=-1)
-            loss = loss_clf + gen_weight * loss_gen.sum()
+            loss = loss_clf + gen_weight * loss_gen.mean()
 
             # If the loss exploded, clear buffer, go back to start of epoch, and reset optimizer
             if loss.abs() > 1e3:
@@ -146,6 +150,19 @@ def train(model: nn.Module,
                 axs[1].set_title(f'energy: {energies_fake[-1]}')
                 plt.show()
 
+        scheduler.step()
+
+        # Test
+        model.eval()
+        with torch.no_grad():
+            test_accs = []
+            for x, y in tqdm(test_dataloader, unit='batch', desc=f'Epoch {e+1}'):
+                x = x.to(device)
+                y = y.to(device)
+                x_logits = model(x)
+                test_accs.append((torch.argmax(x_logits, dim=-1) == y).detach().cpu().numpy().mean())
+
+
         # log metrics
         wandb.log({
             'Training/loss_clf': np.mean(clf_losses),
@@ -154,9 +171,9 @@ def train(model: nn.Module,
             'Training/acc': np.mean(accs),
             'Training/energy_real': np.mean(energies_real),
             'Training/energy_fake': np.mean(energies_fake),
+            'Testing/acc': np.mean(test_accs),
             'epoch': e
         })
-
         e += 1
 
     # Save final model
@@ -226,19 +243,25 @@ if __name__ == "__main__":
         batch_size = 60,
         learning_rate = 1e-4,
         gen_weight = 1,
-        learning_rate_decay = None,
-        learning_rate_epochs = None,
-        train_fraction = 0.1,
+        learning_rate_decay = 0.3,
+        learning_rate_epochs = 50,
+        data_fraction = 0.1,
+        train_fraction = 0.8,
     )
         
     # Use 10% of the dataset
-    subset_size = int(len(full_dataset) * cfg.pop('train_fraction'))
+    subset_size = int(len(full_dataset) * cfg.pop('data_fraction'))
     indices = np.random.RandomState(seed=42).permutation(len(full_dataset))[:subset_size]
-    dataset = torch.utils.data.Subset(full_dataset, indices)
+    train_split = int(len(indices) * cfg.pop('train_fraction'))
+    train_indices = indices[:train_split]
+    test_indices = indices[train_split:]    
+    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+    test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
     wandb.init(project="generative-modelling", config=cfg)
 
     train(model = model,
-          dataset = dataset,
+          train_dataset = train_dataset,
+          test_dataset = test_dataset,
           **cfg)
     
 
