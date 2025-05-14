@@ -6,6 +6,7 @@ import random
 import wandb
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import os
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 verbose_interval = 99
@@ -22,17 +23,19 @@ def train(model: nn.Module,
           learning_rate: float,
           gen_weight: float,
           learning_rate_decay: float,
-          learning_rate_epochs: list[int]):
+          learning_rate_epochs: list[int],
+          model_dir: str = './models'):
     
     buffer = []
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion_clf = torch.nn.CrossEntropyLoss(reduction='sum')
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
+    os.makedirs(model_dir, exist_ok=True)
     model.to(device)
-
-    for e in range(epochs):
+    e = 0 
+    while e < epochs:
         clf_losses = []
         gen_losses = []
         combined_losses = []
@@ -40,6 +43,11 @@ def train(model: nn.Module,
         energies_real = []
         energies_fake = []        
         pbar = tqdm(dataloader, unit='batch', desc=f'Epoch {e+1}')
+
+        # Save checkpoint
+        model_path = f'{model_dir}/checkpoint.pth'
+        torch.save(model.state_dict(), model_path)
+        print(f'Saved checkpoint to {os.path.abspath(model_path)}')
         
         verbose_counter = 0
 
@@ -77,6 +85,15 @@ def train(model: nn.Module,
             xt_logits = model(xt.to(device))
             loss_gen = torch.logsumexp(xt_logits, dim=-1) - torch.logsumexp(x_logits, dim=-1)
             loss = loss_clf + gen_weight * loss_gen.sum()
+
+            # If the loss exploded, clear buffer, go back to start of epoch, and reset optimizer
+            if loss.abs() > 1e3:
+                print(f'Loss exploded, reverting to last checkpoint')
+                model.load_state_dict(torch.load(f'{model_dir}/checkpoint.pth', weights_only=True))
+                buffer = []     
+                e -= 1
+                optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+                break
 
             # do model step using optimizer
             optimizer.zero_grad()
@@ -135,6 +152,12 @@ def train(model: nn.Module,
             'epoch': e
         })
 
+        e += 1
+
+    # Save final model
+    model_path = f'{model_dir}/model.pth'
+    torch.save(model.state_dict(), model_path)
+    print(f'Saved final model to {os.path.abspath(model_path)}')
 
 class CNN(nn.Module):
     def __init__(self, out_dim):
@@ -165,7 +188,7 @@ if __name__ == "__main__":
     from torchvision import models
 
     # Get only a fraction of the dataset
-    full_dataset = MNIST(root='../data', train=True, download=True, transform=transforms.Compose([
+    full_dataset = MNIST(root='./data', train=True, download=True, transform=transforms.Compose([
         transforms.ToTensor(),
         transforms.Lambda(lambda x: x * 2 - 1)
     ]))
@@ -185,7 +208,7 @@ if __name__ == "__main__":
         gen_weight = 1,
         learning_rate_decay = None,
         learning_rate_epochs = None,
-        train_fraction = 0.05,
+        train_fraction = 0.1,
     )
         
     # Use 10% of the dataset
