@@ -39,10 +39,17 @@ def train(model: nn.Module,
     model.to(device)
     e = 0 
     while e < epochs:
+        # Decaying step size and increasing steps
+        decay_rate = 0.94
+        tau = 13
+        initial_step_size = step_size
+        initial_steps = steps
+        max_steps = 100
+        
         # decrease step size with every epoch since in the beginning the landscape is very bad
-        step_size = step_size/(e+1)
+        new_step_size = initial_step_size * (decay_rate ** e)
         # make more steps later in the training
-        steps = steps + e
+        new_steps = int(initial_steps + (max_steps - initial_steps) * (1 - np.exp(-e / tau)))
 
         clf_losses = []
         gen_losses = []
@@ -70,18 +77,23 @@ def train(model: nn.Module,
 
             # # sample starting x from buffer
             xt = torch.empty_like(x)
-            for i in range(x.shape[0]):
+            for i in range(x.shape[0]):  
                 if len(buffer) == 0 or np.random.random() < reinit_freq:
                     # get a new sample in range [-1, 1)
                     xt[i] = torch.rand(x.shape[1:]) * 2 - 1
+                    # # Add small perturbation to avoid identical samples
+                    # xt[i] += 0.05 * torch.randn_like(xt[i])
+                    # CIFAR10 need to be clamped to [-1, 1]
+                    xt = xt.clamp(-1, 1)
+
                 else:
-                    batch = random.choice(buffer)
-                    i = np.random.randint(batch.shape[0])
-                    xt[i] = batch[i]
+                    buffer_batch = random.choice(buffer)
+                    j = np.random.randint(buffer_batch.shape[0])
+                    xt[i] = buffer_batch[j]
                     # xt[i] = random.choice(random.choice(buffer))
 
             # perform SGLD
-            for t in range(steps):
+            for t in range(new_steps):
                 xt = xt.clone().detach().requires_grad_(True).to(device)
                 xt.retain_grad()
                 xt_logits = model(xt)
@@ -93,7 +105,9 @@ def train(model: nn.Module,
 
                 # do step manually
                 with torch.no_grad():
-                    xt = xt + step_size * grad + noise * torch.randn_like(xt)
+                    xt = xt + new_step_size * grad + noise * torch.randn_like(xt)
+                    # xt = xt.clamp(-1, 1)                                            # CIFAR10 need to be clamped to [-1, 1]
+
 
             # # get generation loss
             xt_logits = model(xt.to(device))
@@ -152,9 +166,12 @@ def train(model: nn.Module,
                 print(f'Loss of combined: {loss.detach().cpu().numpy()}')
 
                 fig, axs = plt.subplots(2, 1)
-                axs[0].imshow(x[0].detach().cpu().numpy().reshape(28, 28))
+
+                # axs[0].imshow(x[0].detach().cpu().numpy().reshape(28, 28))
+                axs[0].imshow(x[0].detach().cpu().permute(1, 2, 0))  # for CIFAR-10
                 axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, predicted Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, energy: {energies_real[-1]}')
-                axs[1].imshow(xt[0].detach().cpu().numpy().reshape(28, 28))
+                # axs[1].imshow(xt[0].detach().cpu().numpy().reshape(28, 28))
+                axs[1].imshow(xt[0].detach().cpu().permute(1, 2, 0))  # for CIFAR-10
                 axs[1].set_title(f'energy: {energies_fake[-1]}')
                 plt.show()
 
@@ -192,10 +209,12 @@ def train(model: nn.Module,
 class CNN(nn.Module):
     def __init__(self, out_dim):
         super(CNN, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=5)
+        # self.conv1 = nn.Conv2d(1, 32, kernel_size=5)
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=5)        # To handle CIFAR10
         self.conv2 = nn.Conv2d(32, 32, kernel_size=5)
         self.conv3 = nn.Conv2d(32,64, kernel_size=5)
-        self.fc1 = nn.Linear(3*3*64, 256)
+        # self.fc1 = nn.Linear(3*3*64, 256)
+        self.fc1 = nn.Linear(1024, 256)                     # To handle CIFAR10    
         self.fc2 = nn.Linear(256, out_dim)
 
     def forward(self, x):
@@ -205,7 +224,8 @@ class CNN(nn.Module):
         x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu(F.max_pool2d(self.conv3(x),2))
         x = F.dropout(x, p=0.5, training=self.training)
-        x = x.view(-1,3*3*64 )
+        # x = x.view(-1,3*3*64 )
+        x = torch.flatten(x, start_dim=1)           # To handle CIFAR10
         x = F.relu(self.fc1(x))
         x = F.dropout(x, training=self.training)
         x = self.fc2(x)
@@ -226,15 +246,15 @@ if __name__ == "__main__":
     from torchvision import transforms
     from torchvision import models
 
-    full_dataset = MNIST(root='./data', train=True, download=True, transform=transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: x * 2 - 1)
-    ]))
-
-    # full_dataset = CIFAR10(root='./data', train=True, download=True, transform=transforms.Compose([
+    # full_dataset = MNIST(root='./data', train=True, download=True, transform=transforms.Compose([
     #     transforms.ToTensor(),
     #     transforms.Lambda(lambda x: x * 2 - 1)
     # ]))
+
+    full_dataset = CIFAR10(root='./data', train=True, download=True, transform=transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x * 2 - 1)
+    ]))
 
 
     out_dim = 10
@@ -242,7 +262,7 @@ if __name__ == "__main__":
     # model = WideResNet(out_dim)
 
     cfg = dict(
-        step_size = 0.5, 
+        step_size = 1e-2, 
         noise = 0.01, 
         buffer_size = 1000,
         steps = 20,
@@ -253,7 +273,7 @@ if __name__ == "__main__":
         gen_weight = 1,
         learning_rate_decay = 0.3,
         learning_rate_epochs = 50,
-        data_fraction = 0.1,
+        data_fraction = 1,
         train_fraction = 0.8,
     )
         
