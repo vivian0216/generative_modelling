@@ -9,7 +9,7 @@ import torch.nn.functional as F
 import os
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-verbose_interval = None
+verbose_interval = 50
 
 SHAPE = (1, 28, 28)
 
@@ -27,14 +27,17 @@ def train(model: nn.Module,
           gen_weight: float,
           learning_rate_decay: float,
           learning_rate_epochs: int,
-          model_dir: str = './models'):
+          model_dir: str = './models',
+          image_dir: str | None = None):
 
+    if image_dir is not None:
+        os.makedirs(image_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
-    model.to(device)
 
     # Initialize buffer filled with random samples
     buffer = torch.rand(buffer_size, *SHAPE) * 2 - 1
 
+    model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=learning_rate_epochs, gamma=learning_rate_decay)
     criterion_clf = torch.nn.CrossEntropyLoss(reduction='mean')
@@ -120,28 +123,17 @@ def train(model: nn.Module,
                 'batch': b
             })
 
-            if verbose_interval is not None and b % verbose_interval == 0:
-                print(f'True Y: {y.detach().cpu().numpy()}')
-                print(f'Pred Y: {torch.argmax(x_logits, dim=-1).detach().cpu().numpy()}')
-
-                print(f'Range of x: {x.min().detach().cpu().numpy()} - {x.max().detach().cpu().numpy()}')
-                print(f'Logits of x: {x_logits.detach().cpu().numpy()}')
-                print(f'Energy of x: {-torch.logsumexp(x_logits, dim=-1).detach().cpu().numpy()}')
-                
-                print(f'Range of xt: {xt.min().detach().cpu().numpy()} - {xt.max().detach().cpu().numpy()}')
-                print(f'Logits of xt: {xt_logits.detach().cpu().numpy()}')
-                print(f'Energy of xt: {-torch.logsumexp(xt_logits, dim=-1).detach().cpu().numpy()}')
-
-                print(f'Loss of x: {loss_clf.detach().cpu().numpy()}')
-                print(f'Loss of xt: {loss_gen.detach().cpu().numpy()}')
-                print(f'Loss of combined: {loss.detach().cpu().numpy()}')
-
+            if verbose_interval is not None and b % verbose_interval == 0 or loss.item() < -50:
                 fig, axs = plt.subplots(2, 1)
                 axs[0].imshow(x[0].detach().cpu().numpy().reshape(28, 28))
                 axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, predicted Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, energy: {energy_real}')
                 axs[1].imshow(xt[0].detach().cpu().numpy().reshape(28, 28))
                 axs[1].set_title(f'energy: {energy_fake}')
-                plt.show()
+                if image_dir is not None:
+                    plt.savefig(f'{image_dir}/epoch_{e+1}_batch_{b}.png')
+                    plt.close()
+                else:
+                    plt.show()
 
             b += 1
         scheduler.step()
@@ -248,6 +240,7 @@ if __name__ == "__main__":
     train(model = model,
           train_dataset = train_dataset,
           test_dataset = test_dataset,
+          image_dir = './images',
           **cfg)
     
 
