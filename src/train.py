@@ -27,6 +27,8 @@ def train(model: nn.Module,
           gen_weight: float,
           learning_rate_decay: float,
           learning_rate_epochs: int,
+          checkpoint_interval: int,
+          do_revert: bool = False,
           model_dir: str = './models',
           image_dir: str | None = None):
 
@@ -45,15 +47,13 @@ def train(model: nn.Module,
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     e = 0 
-    b = 0     
-    while e < epochs:                
-
-        # Save checkpoint
-        model_path = f'{model_dir}/checkpoint.pth'
-        torch.save(model.state_dict(), model_path)
-        print(f'Saved checkpoint to {os.path.abspath(model_path)}')
+    b = 0
+    checkpoint_epoch = 0
+    checkpoint_batch = 0
+    while e < epochs:      
 
         # Train
+        failed = False
         pbar = tqdm(train_dataloader, unit='batch', desc=f'Epoch {e+1}')
         for x, y in pbar:
             x = x.to(device)
@@ -71,6 +71,7 @@ def train(model: nn.Module,
                     xt[i] = torch.rand(x.shape[1:]) * 2 - 1
 
             # perform SGLD
+            model.eval() # Disables dropout
             for t in range(steps):
                 xt = xt.clone().detach().requires_grad_(True).to(device)
                 xt.retain_grad()
@@ -84,20 +85,24 @@ def train(model: nn.Module,
                 # do step manually
                 with torch.no_grad():
                     xt = xt + step_size * grad + noise * torch.randn_like(xt)
+            model.train()
 
-            # get generation loss
+            # get generation loss            
             xt_logits = model(xt.to(device))
             loss_gen = torch.logsumexp(xt_logits, dim=-1) - torch.logsumexp(x_logits, dim=-1)
             loss = loss_clf + gen_weight * loss_gen.mean()
 
             # If the loss exploded, clear buffer, go back to start of epoch, and reset optimizer
-            if loss.abs() > 1e3:
-                return
+            if loss.abs() > 1e2:
+                if not do_revert:
+                    return
                 print(f'Loss exploded, reverting to last checkpoint')
                 model.load_state_dict(torch.load(f'{model_dir}/checkpoint.pth', weights_only=True))
-                buffer = []
-                e -= 1
+                buffer = torch.rand(buffer_size, *SHAPE) * 2 - 1
+                e = checkpoint_epoch
+                b = checkpoint_batch
                 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+                failed = True
                 break
 
             # do model step using optimizer
@@ -125,18 +130,27 @@ def train(model: nn.Module,
 
             if verbose_interval is not None and b % verbose_interval == 0 or loss.item() < -50:
                 fig, axs = plt.subplots(2, 1)
-                axs[0].imshow(x[0].detach().cpu().numpy().reshape(28, 28))
-                axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, predicted Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, energy: {energy_real}')
-                axs[1].imshow(xt[0].detach().cpu().numpy().reshape(28, 28))
-                axs[1].set_title(f'energy: {energy_fake}')
+                fig.suptitle(f'Epoch {e+1}, Batch {b}')
+                img_real = x[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
+                axs[0].imshow(img_real * 0.5 + 0.5)
+                axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, predicted Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, energy: {energy_real:.2f}')
+                img_fake = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0).clip(-1, 1)
+                axs[1].imshow(img_fake * 0.5 + 0.5)
+                axs[1].set_title(f'energy: {energy_fake:.2f}')
+                axs[0].set_axis_off()
+                axs[1].set_axis_off()
+                plt.tight_layout()
                 if image_dir is not None:
                     plt.savefig(f'{image_dir}/epoch_{e+1}_batch_{b}.png')
                     plt.close()
                 else:
                     plt.show()
-
             b += 1
+
+        if failed:
+            continue
         scheduler.step()
+        e += 1
 
         # Test
         model.eval()
@@ -150,10 +164,16 @@ def train(model: nn.Module,
         wandb.log({
             'Testing/acc': np.mean(test_accs),
             'epoch': e + 1
-        })
+        })        
        
-        e += 1
-
+        # Save checkpoint
+        if not failed and e % checkpoint_interval == 0 and loss.abs() < 10:
+            model_path = f'{model_dir}/checkpoint.pth'
+            torch.save(model.state_dict(), model_path)
+            print(f'Saved checkpoint to {os.path.abspath(model_path)}')
+            checkpoint_epoch = e
+            checkpoint_batch = b
+        
     # Save final model
     model_path = f'{model_dir}/model.pth'
     torch.save(model.state_dict(), model_path)
@@ -170,7 +190,7 @@ class CNN(nn.Module):
 
     def forward(self, x):
         x = F.relu(self.conv1(x))
-        #x = F.dropout(x, p=0.5, training=self.training)
+        x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu(F.max_pool2d(self.conv2(x), 2))
         x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu(F.max_pool2d(self.conv3(x),2))
@@ -184,7 +204,7 @@ class CNN(nn.Module):
 class WideResNet(nn.Module):
     def __init__(self, out_dim):
         super(WideResNet, self).__init__()
-        self.model = models.wide_resnet50_2(pretrained=True)
+        self.model = models.wide_resnet50_2(weights=models.Wide_ResNet50_2_Weights.IMAGENET1K_V1)
         self.model.fc = nn.Linear(self.model.fc.in_features, out_dim)
 
     def forward(self, x):
@@ -206,7 +226,6 @@ if __name__ == "__main__":
     #     transforms.Lambda(lambda x: x * 2 - 1)
     # ]))
 
-
     out_dim = 10
     model = CNN(out_dim) 
     # model = WideResNet(out_dim)
@@ -215,14 +234,16 @@ if __name__ == "__main__":
         step_size = 0.5, 
         noise = 0.01, 
         buffer_size = 10000,
-        steps = 20,
+        steps = 50,
         reinit_freq = 0.05,
-        epochs = 50,
-        batch_size = 60,
+        epochs = 150,
+        batch_size = 64,
         learning_rate = 1e-4,
         gen_weight = 1,
         learning_rate_decay = 0.3,
         learning_rate_epochs = 50,
+        checkpoint_interval = 5,
+        do_revert = False,
         data_fraction = 0.1,
         train_fraction = 0.8,
     )

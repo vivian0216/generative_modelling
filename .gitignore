@@ -177,3 +177,5 @@ wandb/
 *.pth
 
 /data
+/models
+/images
