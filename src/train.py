@@ -11,6 +11,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 verbose_interval = None
 
+SHAPE = (1, 28, 28)
+
 def train(model: nn.Module,
           train_dataset: torch.utils.data.Dataset,
           test_dataset: torch.utils.data.Dataset,
@@ -26,8 +28,12 @@ def train(model: nn.Module,
           learning_rate_decay: float,
           learning_rate_epochs: int,
           model_dir: str = './models'):
-    
-    buffer = []
+
+    os.makedirs(model_dir, exist_ok=True)
+    model.to(device)
+
+    # Initialize buffer filled with random samples
+    buffer = torch.rand(buffer_size, *SHAPE) * 2 - 1
 
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=learning_rate_epochs, gamma=learning_rate_decay)
@@ -35,8 +41,6 @@ def train(model: nn.Module,
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    os.makedirs(model_dir, exist_ok=True)
-    model.to(device)
     e = 0 
     b = 0     
     while e < epochs:                
@@ -56,16 +60,12 @@ def train(model: nn.Module,
             x_logits = model(x)
             loss_clf = criterion_clf(x_logits, y)
 
-            # # sample starting x from buffer
-            xt = torch.empty_like(x)
+            # sample starting x from buffer, possibly reinitialize
+            buffer_indices = np.random.randint(0, buffer_size, size=x.shape[0])
+            xt = buffer[buffer_indices]
             for i in range(x.shape[0]):
-                if len(buffer) == 0 or np.random.random() < reinit_freq:
-                    # get a new sample in range [-1, 1)
+                if np.random.random() < reinit_freq:
                     xt[i] = torch.rand(x.shape[1:]) * 2 - 1
-                else:
-                    batch = random.choice(buffer)
-                    i = np.random.randint(batch.shape[0])
-                    xt[i] = batch[i]
 
             # perform SGLD
             for t in range(steps):
@@ -82,7 +82,7 @@ def train(model: nn.Module,
                 with torch.no_grad():
                     xt = xt + step_size * grad + noise * torch.randn_like(xt)
 
-            # # get generation loss
+            # get generation loss
             xt_logits = model(xt.to(device))
             loss_gen = torch.logsumexp(xt_logits, dim=-1) - torch.logsumexp(x_logits, dim=-1)
             loss = loss_clf + gen_weight * loss_gen.mean()
@@ -102,10 +102,8 @@ def train(model: nn.Module,
             loss.backward()
             optimizer.step()
 
-            # add xt to buffer
-            buffer.append(xt.cpu().detach())
-            if len(buffer) > (buffer_size / batch_size):
-                buffer = buffer[1:]
+            # update buffer with either further optimized or reinitialized samples
+            buffer[buffer_indices] = xt.cpu().detach()
 
             # log metrics
             energy_real = -torch.logsumexp(x_logits, dim=-1).mean().item()
