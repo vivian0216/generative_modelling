@@ -38,28 +38,16 @@ def train(model: nn.Module,
     os.makedirs(model_dir, exist_ok=True)
     model.to(device)
     e = 0 
-    while e < epochs:
-        # decrease step size with every epoch since in the beginning the landscape is very bad
-        step_size = step_size/(e+1)
-        # make more steps later in the training
-        steps = steps + e
-
-        clf_losses = []
-        gen_losses = []
-        combined_losses = []
-        accs = []
-        energies_real = []
-        energies_fake = []        
-        pbar = tqdm(train_dataloader, unit='batch', desc=f'Epoch {e+1}')
+    b = 0     
+    while e < epochs:                
 
         # Save checkpoint
         model_path = f'{model_dir}/checkpoint.pth'
         torch.save(model.state_dict(), model_path)
         print(f'Saved checkpoint to {os.path.abspath(model_path)}')
-        
-        verbose_counter = 0
 
         # Train
+        pbar = tqdm(train_dataloader, unit='batch', desc=f'Epoch {e+1}')
         for x, y in pbar:
             x = x.to(device)
             y = y.to(device)
@@ -78,7 +66,6 @@ def train(model: nn.Module,
                     batch = random.choice(buffer)
                     i = np.random.randint(batch.shape[0])
                     xt[i] = batch[i]
-                    # xt[i] = random.choice(random.choice(buffer))
 
             # perform SGLD
             for t in range(steps):
@@ -102,9 +89,10 @@ def train(model: nn.Module,
 
             # If the loss exploded, clear buffer, go back to start of epoch, and reset optimizer
             if loss.abs() > 1e3:
+                return
                 print(f'Loss exploded, reverting to last checkpoint')
                 model.load_state_dict(torch.load(f'{model_dir}/checkpoint.pth', weights_only=True))
-                buffer = []     
+                buffer = []
                 e -= 1
                 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
                 break
@@ -119,23 +107,22 @@ def train(model: nn.Module,
             if len(buffer) > (buffer_size / batch_size):
                 buffer = buffer[1:]
 
-            # add metrics
-            clf_losses.append(loss_clf.item())
-            gen_losses.append(loss_gen.mean().item())
-            combined_losses.append(loss.item())
-            accs.append((torch.argmax(x_logits, dim=-1) == y).detach().cpu().numpy().mean())
-            energies_real.append(-torch.logsumexp(x_logits, dim=-1).mean().item())
-            energies_fake.append(-torch.logsumexp(xt_logits, dim=-1).mean().item())
-
-            pbar.set_postfix({
-                'clf_loss': np.mean(clf_losses),
-                'gen_loss': np.mean(gen_losses),
-                'loss': np.mean(combined_losses),
-                'acc': np.mean(accs)
+            # log metrics
+            energy_real = -torch.logsumexp(x_logits, dim=-1).mean().item()
+            energy_fake = -torch.logsumexp(xt_logits, dim=-1).mean().item()
+            wandb.log({
+                'Training/loss_clf': loss_clf.item(),
+                'Training/loss_gen': loss_gen.mean().item(),
+                'Training/loss': loss.item(),
+                'Training/acc':(torch.argmax(x_logits, dim=-1) == y).detach().cpu().numpy().mean(),
+                'Training/energy_real': energy_real,
+                'Training/energy_fake': energy_fake,
+                'Training/max_l1': xt.abs().max().item(),
+                'epoch': e + 1,
+                'batch': b
             })
 
-            verbose_counter += 1
-            if verbose_interval is not None and verbose_counter % verbose_interval == 0:
+            if verbose_interval is not None and b % verbose_interval == 0:
                 print(f'True Y: {y.detach().cpu().numpy()}')
                 print(f'Pred Y: {torch.argmax(x_logits, dim=-1).detach().cpu().numpy()}')
 
@@ -153,11 +140,12 @@ def train(model: nn.Module,
 
                 fig, axs = plt.subplots(2, 1)
                 axs[0].imshow(x[0].detach().cpu().numpy().reshape(28, 28))
-                axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, predicted Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, energy: {energies_real[-1]}')
+                axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, predicted Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, energy: {energy_real}')
                 axs[1].imshow(xt[0].detach().cpu().numpy().reshape(28, 28))
-                axs[1].set_title(f'energy: {energies_fake[-1]}')
+                axs[1].set_title(f'energy: {energy_fake}')
                 plt.show()
 
+            b += 1
         scheduler.step()
 
         # Test
@@ -169,19 +157,11 @@ def train(model: nn.Module,
                 y = y.to(device)
                 x_logits = model(x)
                 test_accs.append((torch.argmax(x_logits, dim=-1) == y).detach().cpu().numpy().mean())
-
-
-        # log metrics
         wandb.log({
-            'Training/loss_clf': np.mean(clf_losses),
-            'Training/loss_gen': np.mean(gen_losses),
-            'Training/loss': np.mean(combined_losses),
-            'Training/acc': np.mean(accs),
-            'Training/energy_real': np.mean(energies_real),
-            'Training/energy_fake': np.mean(energies_fake),
             'Testing/acc': np.mean(test_accs),
-            'epoch': e
+            'epoch': e + 1
         })
+       
         e += 1
 
     # Save final model
@@ -244,7 +224,7 @@ if __name__ == "__main__":
     cfg = dict(
         step_size = 0.5, 
         noise = 0.01, 
-        buffer_size = 1000,
+        buffer_size = 10000,
         steps = 20,
         reinit_freq = 0.05,
         epochs = 50,
