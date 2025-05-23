@@ -2,12 +2,12 @@ import torch
 import torch.nn as nn
 import numpy as np
 from tqdm import tqdm
-import random 
 import wandb
 import matplotlib.pyplot as plt
+import inspect
 import torch.nn.functional as F
 import os
-from typing import Literal
+from typing import Callable
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 SHAPE = (1, 28, 28)
@@ -16,19 +16,17 @@ SHAPE = (1, 28, 28)
 def train(model: nn.Module,
           train_dataset: torch.utils.data.Dataset,
           test_dataset: torch.utils.data.Dataset,
-          sgld_steps: int = 40, # In the paper they start with 20 and increase to 40. Not explained when they do this, so default to reproduce is use 40 for the whole run.
-          sgld_step_size: float = 1,
-          sgld_noise: float = 0.01,       
-          sgld_schedule: Literal['fixed', 'exponential', 'linear', 'cosine'] = 'fixed',   
-          sgld_schedule_exponential_decay: float = 0.2,  # Only used if sgld_schedule is 'exponential'
-          buffer_size: int = 10000,
-          reinit_freq: float = 0.05,
           epochs: int = 150,
           batch_size: int = 64,
-          learning_rate: float = 1e-4,
+          optimizer = lambda x: torch.optim.Adam(x, lr=1e-4),
+          scheduler = lambda x: torch.optim.lr_scheduler.StepLR(x, step_size=50, gamma=0.3),
+          sgld_steps: int = 40, # In the paper they start with 20 and increase to 40. Not explained when they do this, so default to reproduce is use 40 for the whole run.
+          sgld_optimizer = lambda x: torch.optim.SGD(x, lr=1.0),
+          sgld_scheduler = lambda x: torch.optim.lr_scheduler.ConstantLR(x, factor=1.0),
+          sgld_noise: float = 0.01,
           gen_weight: float = 1,
-          learning_rate_decay: float = 0.3,
-          learning_rate_epochs: int = 50,
+          buffer_size: int = 10000,
+          reinit_freq: float = 0.05,         
           loss_explosion_threshold: float | None = 1e8, # If not None, catch when absolute loss is greater than threshold
           revert_on_loss_explosion: bool = False, # If True, revert to last checkpoint if loss explosion is detected
           checkpoint_interval: int = 1,
@@ -40,15 +38,15 @@ def train(model: nn.Module,
         os.makedirs(image_dir, exist_ok=True)
     os.makedirs(model_dir, exist_ok=True)
 
-    # Initialize buffer filled with random samples
-    buffer = torch.rand(buffer_size, *SHAPE) * 2 - 1
-
     model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=learning_rate_epochs, gamma=learning_rate_decay)
+    _optimizer = optimizer(model.parameters())
+    _scheduler = scheduler(_optimizer)
     criterion_clf = torch.nn.CrossEntropyLoss(reduction='mean')
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    # Initialize buffer filled with random samples
+    buffer = torch.rand(buffer_size, *SHAPE) * 2 - 1
 
     e = 0 
     b = 0
@@ -74,42 +72,27 @@ def train(model: nn.Module,
                 if np.random.random() < reinit_freq:
                     xt[i] = torch.rand(x.shape[1:]) * 2 - 1
 
-            # perform SGLD
-            model.eval() # Disables dropout
+            # perform SGLD, using torch optimizers            
+            xt = xt.detach().to(device).requires_grad_(True)
+            _sgld_optimizer = sgld_optimizer([xt])
+            _sgld_scheduler = sgld_scheduler(_sgld_optimizer)
+            model.eval() # Disables dropout etc.
             for t in range(sgld_steps):
-                xt = xt.clone().detach().requires_grad_(True).to(device)
-                xt.retain_grad()
+ 
                 xt_logits = model(xt)
-                logsumexp = torch.logsumexp(xt_logits, dim=-1)
+                energy = -torch.logsumexp(xt_logits, dim=-1)
                 
                 # compute gradients
-                logsumexp.sum().backward()
-                grad = xt.grad
+                _sgld_optimizer.zero_grad()
+                energy.sum().backward()
+                
+                # Do gradient step to minimize the energy using the optimizer
+                # Equivalent to maximizing the logsumexp as in the paper's pseudocode
+                _sgld_optimizer.step()
+                _sgld_scheduler.step()
 
-                # do step manually
-                with torch.no_grad():
-                    if sgld_schedule == 'fixed':
-                        # Improper biased SGLD as used in the paper
-                        xt = xt + sgld_step_size * grad + sgld_noise * torch.randn_like(xt)
-                    elif sgld_schedule == 'exponential':
-                        # SLGD with decaying step size as proposed by Welling and Teh.
-                        # Note the swapped sign of grad versus the literature, because we used logsumexp, and energy is negative logsumpexp.
-                        # To be accurate, step size and noise should be set equally in the parameters, but this implementaiton allows them to differ
-                        factor = np.pow(1+t, -sgld_schedule_exponential_decay)
-                        alpha_t = sgld_step_size * factor
-                        epsilon_t = sgld_noise * factor
-                        xt = xt + alpha_t/2 * grad + epsilon_t * torch.randn_like(xt)
-                    elif sgld_schedule == 'linear':
-                        # Linearly decrease both step size and noise
-                        alpha_t = sgld_step_size * (1 - t / sgld_steps)
-                        epsilon_t = sgld_noise * (1 - t / sgld_steps)
-                        xt = xt + alpha_t * grad + epsilon_t * torch.randn_like(xt)
-                    elif sgld_schedule == 'cosine':
-                        # Cosine decay schedule
-                        factor = 0.5 + 0.5 * np.cos(np.pi * t / sgld_steps)
-                        alpha_t = sgld_step_size * factor
-                        epsilon_t = sgld_noise * factor
-                        xt = xt + alpha_t * grad + epsilon_t * torch.randn_like(xt)                            
+                # Add noise afterwards to complete the iteration, not decayed by the scheduler
+                xt.data += sgld_noise * torch.randn_like(xt)
 
                 # Save images   
                 if verbose_interval is not None and b % verbose_interval == 0 or loss.item() < -50 and image_dir is not None:
@@ -135,14 +118,17 @@ def train(model: nn.Module,
                 buffer = torch.rand(buffer_size, *SHAPE) * 2 - 1
                 e = checkpoint_epoch
                 b = checkpoint_batch
-                optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+                _optimizer = optimizer(model.parameters())
+                _scheduler = scheduler(_optimizer)
+                for _ in range(e):
+                    _scheduler.step() # Make sure scheduler is at the correct epoch
                 failed = True
                 break
 
             # do model step using optimizer
-            optimizer.zero_grad()
+            _optimizer.zero_grad()
             loss.backward()
-            optimizer.step()
+            _optimizer.step()
 
             # update buffer with either further optimized or reinitialized samples
             buffer[buffer_indices] = xt.cpu().detach()
@@ -164,24 +150,16 @@ def train(model: nn.Module,
 
             # save images (of first one in batch)
             if verbose_interval is not None and b % verbose_interval == 0:
-                fig, axs = plt.subplots(2, 2)
+                fig, axs = plt.subplots(2, 1)
                 fig.suptitle(f'Epoch {e+1}, Batch {b}')
                 img_real = x[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
-                axs[0, 0].imshow(img_real.clip(-1, 1) * 0.5 + 0.5)
-                axs[0, 0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, pred Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, E={energy_real:.2f}')
-                axs[0, 0].set_axis_off()
+                axs[0].imshow(img_real.clip(-1, 1) * 0.5 + 0.5)
+                axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, pred Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, E={energy_real:.2f}')
+                axs[0].set_axis_off()
                 img_fake = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
-                axs[1, 0].imshow(img_fake.clip(-1, 1) * 0.5 + 0.5)
-                axs[1, 0].set_title(f'SGLD Gen E={energy_fake:.2f}')                
-                axs[1, 0].set_axis_off()
-                img_grad = grad[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
-                axs[0, 1].imshow(img_grad.clip(-1, 1) * 0.5 + 0.5)
-                axs[0, 1].set_title(f'SGLD Grad max={grad[0].detach().abs().max().cpu().numpy():.2f}')
-                axs[0, 1].set_axis_off()
-                img_fake_next = (img_fake + sgld_step_size * img_grad)
-                axs[1, 1].imshow(img_fake_next.clip(-1, 1) * 0.5 + 0.5)
-                axs[1, 1].set_title(f'Next SGLD Step')
-                axs[1, 1].set_axis_off()
+                axs[1].imshow(img_fake.clip(-1, 1) * 0.5 + 0.5)
+                axs[1].set_title(f'SGLD Gen E={energy_fake:.2f}')                
+                axs[1].set_axis_off()
                 plt.tight_layout()
                 if image_dir is not None:
                     plt.savefig(f'{image_dir}/epoch_{e+1}_batch_{b}.png')
@@ -192,7 +170,7 @@ def train(model: nn.Module,
 
         if failed:
             continue
-        scheduler.step()
+        _scheduler.step()
         e += 1
 
         # Test
@@ -275,21 +253,26 @@ if __name__ == "__main__":
     # SHAPE = (3, 32, 32)
     # model = WideResNet(out_dim)     
 
-    cfg = dict(
-        sgld_steps = 40,
-        sgld_step_size = 1, 
-        sgld_noise = 0.01, 
-        sgld_schedule= 'linear',
-        buffer_size = 10000,
-        reinit_freq = 0.05,
+    cfg = dict(       
+        # Training parameters
         epochs = 150,
         batch_size = 64,
-        learning_rate = 1e-4,
+        optimizer = lambda x: torch.optim.Adam(x, lr=1e-4),
+        scheduler = lambda x: torch.optim.lr_scheduler.StepLR(x, step_size=50, gamma=0.3),
+
+        # SGLD parameters
+        sgld_steps = 40,
+        sgld_noise = 0.01, 
+        sgld_optimizer = lambda x: torch.optim.SGD(x, lr=1.0),
+        sgld_scheduler = lambda x: torch.optim.lr_scheduler.ConstantLR(x, factor=1.0),
         gen_weight = 1,
-        learning_rate_decay = 0.3,
-        learning_rate_epochs = 50,
-        checkpoint_interval = 1,
+        buffer_size = 10000,
+        reinit_freq = 0.05,
+
+        # Misc
+        loss_explosion_threshold = 1e2,
         revert_on_loss_explosion = False,
+        checkpoint_interval = 1,
         data_fraction = 1,
         train_fraction = 0.8,
         verbose_interval = 50
@@ -303,13 +286,16 @@ if __name__ == "__main__":
     test_indices = indices[train_split:]    
     train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
     test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
-    wandb.init(project="generative-modelling", config=cfg)
+
+    # Turn the lambdas into strings for logging
+    pretty_cfg = cfg.copy()
+    for k, v in pretty_cfg.items():
+        if isinstance(v, Callable):
+            pretty_cfg[k] = inspect.getsource(v).split('lambda x: ')[1][:-2]
+    wandb.init(project="generative-modelling", config=pretty_cfg)
 
     train(model = model,
           train_dataset = train_dataset,
           test_dataset = test_dataset,
           image_dir = './images',
-          **cfg)
-    
-
-        
+          **cfg)       
