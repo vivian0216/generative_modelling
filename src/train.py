@@ -7,28 +7,32 @@ import wandb
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import os
+from typing import Literal
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 verbose_interval = 50
 
 SHAPE = (1, 28, 28)
 
+# Default values are the ones used in the paper
 def train(model: nn.Module,
           train_dataset: torch.utils.data.Dataset,
           test_dataset: torch.utils.data.Dataset,
-          step_size: float, 
-          noise: float, 
-          buffer_size: int,
-          steps: int,
-          reinit_freq: float,
-          epochs: int,
-          batch_size: int,
-          learning_rate: float,
-          gen_weight: float,
-          learning_rate_decay: float,
-          learning_rate_epochs: int,
-          checkpoint_interval: int,
+          sgld_steps: int = 40, # In the paper they start with 20 and increase to 40. Not explained when they do this, so default to reproduce is use 40 for the whole run.
+          sgld_step_size: float = 1,
+          sgld_noise: float = 0.01,       
+          sgld_schedule: Literal['fixed', 'exponential', 'linear', 'cosine'] = 'fixed',    
+          buffer_size: int = 10000,
+          reinit_freq: float = 0.05,
+          epochs: int = 150,
+          batch_size: int = 64,
+          learning_rate: float = 1e-4,
+          gen_weight: float = 1,
+          learning_rate_decay: float = 0.3,
+          learning_rate_epochs: int = 50,
+          checkpoint_interval: int = 1,
           do_revert: bool = False,
+          sgld_schedule_exponential_decay: float = 0.2,
           model_dir: str = './models',
           image_dir: str | None = None):
 
@@ -72,7 +76,7 @@ def train(model: nn.Module,
 
             # perform SGLD
             model.eval() # Disables dropout
-            for t in range(steps):
+            for t in range(sgld_steps):
                 xt = xt.clone().detach().requires_grad_(True).to(device)
                 xt.retain_grad()
                 xt_logits = model(xt)
@@ -84,7 +88,36 @@ def train(model: nn.Module,
 
                 # do step manually
                 with torch.no_grad():
-                    xt = xt + step_size * grad + noise * torch.randn_like(xt)
+                    if sgld_schedule == 'fixed':
+                        # Improper biased SGLD as used in the paper
+                        xt = xt + sgld_step_size * grad + sgld_noise * torch.randn_like(xt)
+                    elif sgld_schedule == 'exponential':
+                        # SLGD with decaying step size as proposed by Welling and Teh.
+                        # Note the swapped sign of grad versus the literature, because we used logsumexp, and energy is negative logsumpexp.
+                        # To be accurate, step size and noise should be set equally in the parameters, but this implementaiton allows them to differ
+                        factor = np.pow(1+t, -sgld_schedule_exponential_decay)
+                        alpha_t = sgld_step_size * factor
+                        epsilon_t = sgld_noise * factor
+                        xt = xt + alpha_t/2 * grad + epsilon_t * torch.randn_like(xt)
+                    elif sgld_schedule == 'linear':
+                        # Linearly decrease both step size and noise
+                        alpha_t = sgld_step_size * (1 - t / sgld_steps)
+                        epsilon_t = sgld_noise * (1 - t / sgld_steps)
+                        xt = xt + alpha_t * grad + epsilon_t * torch.randn_like(xt)
+                    elif sgld_schedule == 'cosine':
+                        # Cosine decay schedule
+                        factor = 0.5 + 0.5 * np.cos(np.pi * t / sgld_steps)
+                        alpha_t = sgld_step_size * factor
+                        epsilon_t = sgld_noise * factor
+                        xt = xt + alpha_t * grad + epsilon_t * torch.randn_like(xt)                            
+
+                if verbose_interval is not None and b % verbose_interval == 0 or loss.item() < -50 and image_dir is not None:
+                    if t % 10 == 0 or sgld_steps - t < 10: # save every 10 steps or the last 10 steps
+                        img = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
+                        plt.imshow(img * 0.5 + 0.5)
+                        os.makedirs(f'{image_dir}/sgld', exist_ok=True)
+                        plt.savefig(f'{image_dir}/sgld/epoch_{e+1}_batch_{b}_step_{t}.png')
+                        plt.close()
             model.train()
 
             # get generation loss            
@@ -128,17 +161,29 @@ def train(model: nn.Module,
                 'batch': b
             })
 
-            if verbose_interval is not None and b % verbose_interval == 0 or loss.item() < -50:
-                fig, axs = plt.subplots(2, 1)
+            # save images (of first one in batch)
+            if verbose_interval is not None and b % verbose_interval == 0:
+                fig, axs = plt.subplots(2, 2)
                 fig.suptitle(f'Epoch {e+1}, Batch {b}')
                 img_real = x[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
-                axs[0].imshow(img_real * 0.5 + 0.5)
-                axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, predicted Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, energy: {energy_real:.2f}')
-                img_fake = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0).clip(-1, 1)
-                axs[1].imshow(img_fake * 0.5 + 0.5)
-                axs[1].set_title(f'energy: {energy_fake:.2f}')
-                axs[0].set_axis_off()
-                axs[1].set_axis_off()
+                axs[0, 0].imshow(img_real * 0.5 + 0.5)
+                axs[0, 0].clim(-0.5,1.5)
+                axs[0, 0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, pred Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, E={energy_real:.2f}')
+                axs[0, 0].set_axis_off()
+                img_fake = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
+                axs[1, 0].imshow(img_fake * 0.5 + 0.5)
+                axs[1, 0].clim(-0.5,1.5)
+                axs[1, 0].set_title(f'SGLD gen: E={energy_fake:.2f}')                
+                axs[1, 0].set_axis_off()
+                img_grad = grad[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
+                axs[0, 1].imshow(img_grad)
+                axs[0, 1].set_title(f'SGLD grad: {grad[0].detach().abs().mean().cpu().numpy():.2f}')
+                axs[0, 1].set_axis_off()
+                img_fake_next = (img_fake + sgld_step_size * img_grad)
+                axs[1, 1].imshow(img_fake_next * 0.5 + 0.5)
+                axs[1, 1].clim(-0.5,1.5)
+                axs[1, 1].set_title(f'Next SGLD Step')
+                axs[1, 1].set_axis_off()
                 plt.tight_layout()
                 if image_dir is not None:
                     plt.savefig(f'{image_dir}/epoch_{e+1}_batch_{b}.png')
@@ -163,7 +208,7 @@ def train(model: nn.Module,
                 test_accs.append((torch.argmax(x_logits, dim=-1) == y).detach().cpu().numpy().mean())
         wandb.log({
             'Testing/acc': np.mean(test_accs),
-            'epoch': e + 1
+            'epoch': e
         })        
        
         # Save checkpoint
@@ -231,10 +276,11 @@ if __name__ == "__main__":
     # model = WideResNet(out_dim)
 
     cfg = dict(
-        step_size = 0.5, 
-        noise = 0.01, 
+        sgld_steps = 40,
+        sgld_step_size = 1, 
+        sgld_noise = 0.01, 
+        sgld_schedule= 'linear',
         buffer_size = 10000,
-        steps = 50,
         reinit_freq = 0.05,
         epochs = 150,
         batch_size = 64,
@@ -242,9 +288,9 @@ if __name__ == "__main__":
         gen_weight = 1,
         learning_rate_decay = 0.3,
         learning_rate_epochs = 50,
-        checkpoint_interval = 5,
+        checkpoint_interval = 1,
         do_revert = False,
-        data_fraction = 0.1,
+        data_fraction = 1,
         train_fraction = 0.8,
     )
         
