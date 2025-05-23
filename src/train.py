@@ -10,8 +10,6 @@ import os
 from typing import Literal
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-verbose_interval = 50
-
 SHAPE = (1, 28, 28)
 
 # Default values are the ones used in the paper
@@ -21,7 +19,8 @@ def train(model: nn.Module,
           sgld_steps: int = 40, # In the paper they start with 20 and increase to 40. Not explained when they do this, so default to reproduce is use 40 for the whole run.
           sgld_step_size: float = 1,
           sgld_noise: float = 0.01,       
-          sgld_schedule: Literal['fixed', 'exponential', 'linear', 'cosine'] = 'fixed',    
+          sgld_schedule: Literal['fixed', 'exponential', 'linear', 'cosine'] = 'fixed',   
+          sgld_schedule_exponential_decay: float = 0.2,  # Only used if sgld_schedule is 'exponential'
           buffer_size: int = 10000,
           reinit_freq: float = 0.05,
           epochs: int = 150,
@@ -30,9 +29,10 @@ def train(model: nn.Module,
           gen_weight: float = 1,
           learning_rate_decay: float = 0.3,
           learning_rate_epochs: int = 50,
+          loss_explosion_threshold: float | None = 1e8, # If not None, catch when absolute loss is greater than threshold
+          revert_on_loss_explosion: bool = False, # If True, revert to last checkpoint if loss explosion is detected
           checkpoint_interval: int = 1,
-          do_revert: bool = False,
-          sgld_schedule_exponential_decay: float = 0.2,
+          verbose_interval: int | None = 50,
           model_dir: str = './models',
           image_dir: str | None = None):
 
@@ -111,10 +111,11 @@ def train(model: nn.Module,
                         epsilon_t = sgld_noise * factor
                         xt = xt + alpha_t * grad + epsilon_t * torch.randn_like(xt)                            
 
+                # Save images   
                 if verbose_interval is not None and b % verbose_interval == 0 or loss.item() < -50 and image_dir is not None:
                     if t % 10 == 0 or sgld_steps - t < 10: # save every 10 steps or the last 10 steps
                         img = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
-                        plt.imshow(img * 0.5 + 0.5)
+                        plt.imshow(img.clip(-1,1) * 0.5 + 0.5)
                         os.makedirs(f'{image_dir}/sgld', exist_ok=True)
                         plt.savefig(f'{image_dir}/sgld/epoch_{e+1}_batch_{b}_step_{t}.png')
                         plt.close()
@@ -126,8 +127,8 @@ def train(model: nn.Module,
             loss = loss_clf + gen_weight * loss_gen.mean()
 
             # If the loss exploded, clear buffer, go back to start of epoch, and reset optimizer
-            if loss.abs() > 1e2:
-                if not do_revert:
+            if loss_explosion_threshold is not None and loss.abs() > loss_explosion_threshold:
+                if not revert_on_loss_explosion:
                     return
                 print(f'Loss exploded, reverting to last checkpoint')
                 model.load_state_dict(torch.load(f'{model_dir}/checkpoint.pth', weights_only=True))
@@ -166,23 +167,19 @@ def train(model: nn.Module,
                 fig, axs = plt.subplots(2, 2)
                 fig.suptitle(f'Epoch {e+1}, Batch {b}')
                 img_real = x[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
-                img_obj = axs[0, 0].imshow(img_real * 0.5 + 0.5)
-                img_obj.set_clim(-0.5,1.5)
+                axs[0, 0].imshow(img_real.clip(-1, 1) * 0.5 + 0.5)
                 axs[0, 0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, pred Y: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, E={energy_real:.2f}')
                 axs[0, 0].set_axis_off()
                 img_fake = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
-                img_obj = axs[1, 0].imshow(img_fake * 0.5 + 0.5)
-                img_obj.set_clim(-0.5,1.5)
+                axs[1, 0].imshow(img_fake.clip(-1, 1) * 0.5 + 0.5)
                 axs[1, 0].set_title(f'SGLD Gen E={energy_fake:.2f}')                
                 axs[1, 0].set_axis_off()
                 img_grad = grad[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
-                img_obj = axs[0, 1].imshow(img_grad)
-                img_obj.set_clim(-0.5,1.5)
+                axs[0, 1].imshow(img_grad.clip(-1, 1) * 0.5 + 0.5)
                 axs[0, 1].set_title(f'SGLD Grad max={grad[0].detach().abs().max().cpu().numpy():.2f}')
                 axs[0, 1].set_axis_off()
                 img_fake_next = (img_fake + sgld_step_size * img_grad)
-                img_obj = axs[1, 1].imshow(img_fake_next * 0.5 + 0.5)
-                img_obj.set_clim(-0.5,1.5)
+                axs[1, 1].imshow(img_fake_next.clip(-1, 1) * 0.5 + 0.5)
                 axs[1, 1].set_title(f'Next SGLD Step')
                 axs[1, 1].set_axis_off()
                 plt.tight_layout()
@@ -210,10 +207,10 @@ def train(model: nn.Module,
         wandb.log({
             'Testing/acc': np.mean(test_accs),
             'epoch': e
-        })        
-       
+        })
+
         # Save checkpoint
-        if not failed and e % checkpoint_interval == 0 and loss.abs() < 10:
+        if not failed and e % checkpoint_interval == 0:
             model_path = f'{model_dir}/checkpoint.pth'
             torch.save(model.state_dict(), model_path)
             print(f'Saved checkpoint to {os.path.abspath(model_path)}')
@@ -266,15 +263,17 @@ if __name__ == "__main__":
         transforms.ToTensor(),
         transforms.Lambda(lambda x: x * 2 - 1)
     ]))
+    out_dim = 10
+    SHAPE = (1, 28, 28)
+    model = CNN(out_dim)
 
     # full_dataset = CIFAR10(root='./data', train=True, download=True, transform=transforms.Compose([
     #     transforms.ToTensor(),
     #     transforms.Lambda(lambda x: x * 2 - 1)
     # ]))
-
-    out_dim = 10
-    model = CNN(out_dim) 
-    # model = WideResNet(out_dim)
+    # out_dim = 10
+    # SHAPE = (3, 32, 32)
+    # model = WideResNet(out_dim)     
 
     cfg = dict(
         sgld_steps = 40,
@@ -290,9 +289,10 @@ if __name__ == "__main__":
         learning_rate_decay = 0.3,
         learning_rate_epochs = 50,
         checkpoint_interval = 1,
-        do_revert = False,
+        revert_on_loss_explosion = False,
         data_fraction = 1,
         train_fraction = 0.8,
+        verbose_interval = 50
     )
         
     # Use 10% of the dataset
