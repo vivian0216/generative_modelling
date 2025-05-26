@@ -76,25 +76,11 @@ def train(model: nn.Module,
             xt = xt.detach().to(device).requires_grad_(True)
             _sgld_optimizer = sgld_optimizer([xt])
             _sgld_scheduler = sgld_scheduler(_sgld_optimizer)
+            lr_init = _sgld_scheduler.get_last_lr()[0]
             model.eval() # Disables dropout etc.
             for t in range(sgld_steps):
- 
-                xt_logits = model(xt)
-                energy = -torch.logsumexp(xt_logits, dim=-1)
-                
-                # compute gradients
-                _sgld_optimizer.zero_grad()
-                energy.sum().backward()
-                
-                # Do gradient step to minimize the energy using the optimizer
-                # Equivalent to maximizing the logsumexp as in the paper's pseudocode
-                _sgld_optimizer.step()
-                _sgld_scheduler.step()
 
-                # Add noise afterwards to complete the iteration, not decayed by the scheduler
-                xt.data += sgld_noise * torch.randn_like(xt)
-
-                # Save images   
+                # Save first image in batch
                 if verbose_interval is not None and b % verbose_interval == 0 or loss.item() < -50 and image_dir is not None:
                     if t % 10 == 0 or sgld_steps - t < 10: # save every 10 steps or the last 10 steps
                         img = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
@@ -102,6 +88,24 @@ def train(model: nn.Module,
                         os.makedirs(f'{image_dir}/sgld', exist_ok=True)
                         plt.savefig(f'{image_dir}/sgld/epoch_{e+1}_batch_{b}_step_{t}.png')
                         plt.close()
+                
+                # compute gradients                 
+                xt_logits = model(xt)
+                energy = -torch.logsumexp(xt_logits, dim=-1)
+                _sgld_optimizer.zero_grad()
+                energy.sum().backward()
+                
+                # Do gradient step to minimize the energy using the optimizer
+                # Equivalent to maximizing the logsumexp as in the paper's pseudocode
+                _sgld_optimizer.step()
+                
+                # Add noise afterwards to complete the iteration, measure change in lr to reuse the scheduler decay
+                lr_last = _sgld_scheduler.get_last_lr()[0]
+                xt.data += (lr_last/lr_init) * sgld_noise * torch.randn_like(xt)
+
+                # Decay the step size and noise
+                _sgld_scheduler.step()
+
             model.train()
 
             # get generation loss            
