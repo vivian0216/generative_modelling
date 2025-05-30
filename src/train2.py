@@ -238,6 +238,14 @@ def train(model: nn.Module,
                     
                     axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, predicted: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, energy: {energies_real[-1]:.2f}')
                     axs[1].set_title(f'Generated sample, energy: {energies_fake[-1]:.2f}')
+
+                    # save the current image in images/mnist_training
+                    if not os.path.exists('images'):
+                        os.makedirs('images')
+                    if not os.path.exists('images/mnist_training'):
+                        os.makedirs('images/mnist_training')
+                    plt.savefig(f'images/mnist_training/sample_epoch_{e+1}_batch_{batch_idx}.png')
+
                     
                     fig.canvas.draw_idle()   # Update the figure
                     fig.canvas.flush_events()  # Flush the GUI events
@@ -296,7 +304,7 @@ def train(model: nn.Module,
         e += 1
 
     # Save final model
-    model_path = f'{model_dir}/model.pth'
+    model_path = f'{model_dir}/final_mnist_from_train2.pth'
     torch.save(model.state_dict(), model_path)
     print(f'Saved final model to {os.path.abspath(model_path)}')
 
@@ -350,7 +358,7 @@ if __name__ == "__main__":
 
     # Set verbose interval if flag is provided
     if args.verbose:
-        verbose_interval = 100  # Show samples every 100 batches
+        verbose_interval = 650  # Show samples every _ batches
     
     if args.dataset == 'mnist':
         print("Using MNIST dataset")
@@ -391,10 +399,10 @@ if __name__ == "__main__":
             buffer_size = 1000,
             steps = 20,
             reinit_freq = 0.05,
-            epochs = 150,
+            epochs = 50,
             batch_size = 50,
             learning_rate = 1e-4,
-            gen_weight = 0.5,  # Lower gen_weight for stability
+            gen_weight = 1,  # Lower gen_weight for stability
             learning_rate_decay = 0.3,
             learning_rate_epochs = 50,
             data_fraction = 1.0,  # Use full training set
