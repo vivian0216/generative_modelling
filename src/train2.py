@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import os
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f'Using device: {device}')
 
 verbose_interval = None
 
@@ -25,7 +26,7 @@ def train(model: nn.Module,
           gen_weight: float,
           learning_rate_decay: float,
           learning_rate_epochs: int,
-          model_dir: str = './models'):
+          model_dir: str):
     
     buffer = []
     
@@ -346,6 +347,8 @@ if __name__ == "__main__":
                         help='dataset to use (default: mnist)')
     parser.add_argument('--verbose', action='store_true', 
                         help='Enable verbose output with sample visualizations')
+    parser.add_argument('--model', type=str, default='cnn', choices=['cnn', 'wideresnet'], 
+                        help='Model architecture to use (default: cnn)')
     args = parser.parse_args()
 
     # Set verbose interval if flag is provided
@@ -376,12 +379,15 @@ if __name__ == "__main__":
         input_channels = 3
 
     out_dim = 10
+    model_dir = './models'
     
     # Model selection based on dataset
-    if args.dataset == 'mnist':
+    if args.model == 'cnn':
         model = CNN(out_dim)  # CNN works well for MNIST
+        model_dir = './models/cnn'
     else:
         model = WideResNet(out_dim)  # WideResNet better for CIFAR
+        model_dir = './models/wideresnet'
 
     # Configure dataset-specific hyperparameters
     if args.dataset == 'mnist':
@@ -434,4 +440,5 @@ if __name__ == "__main__":
     train(model = model,
           train_dataset = train_dataset,
           test_dataset = test_dataset,
+          model_dir = model_dir,
           **cfg)
