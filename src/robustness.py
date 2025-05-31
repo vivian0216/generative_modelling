@@ -118,3 +118,32 @@ for eps in l2_epsilons:
     
     print(f"L2 eps {eps}: Adversarial accuracy = {adv_accuracy_base_L2:.2f}%")
 
+# Create foolbox model for JEM
+fmodel_jem = fb.PyTorchModel(jem_model, bounds=(-1, 1))
+
+# L-infinity PGD attack on JEM model
+print("\nL-infinity PGD Attack Results on JEM Model:")
+for eps in linf_epsilons:
+    _, adversarial, success = linf_attack(fmodel_jem, images, labels, epsilons=eps)
+    
+    # Calculate accuracy on adversarial examples
+    with torch.no_grad():
+        adv_outputs = jem_model(adversarial)
+        _, adv_predicted = torch.max(adv_outputs, 1)
+        adv_accuracy_jem_Linf = (adv_predicted == labels).float().mean().item() * 100
+    
+    print(f"L-inf eps {eps}: Adversarial accuracy = {adv_accuracy_jem_Linf:.2f}%")
+
+# L2 PGD attack on JEM model
+print("\nL2 PGD Attack Results on JEM Model:")
+for eps in l2_epsilons:
+    _, adversarial, success = l2_attack(fmodel_jem, images, labels, epsilons=eps)
+    
+    # Calculate accuracy on adversarial examples
+    with torch.no_grad():
+        adv_outputs = jem_model(adversarial)
+        _, adv_predicted = torch.max(adv_outputs, 1)
+        adv_accuracy_jem_L2 = (adv_predicted == labels).float().mean().item() * 100
+    
+    print(f"L2 eps {eps}: Adversarial accuracy = {adv_accuracy_jem_L2:.2f}%")
+
