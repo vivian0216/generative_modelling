@@ -153,7 +153,7 @@ def train(model: nn.Module,
                 'Training/acc':(torch.argmax(x_logits, dim=-1) == y).detach().cpu().numpy().mean(),
                 'Training/energy_real': energy_real,
                 'Training/energy_fake': energy_fake,
-                'Training/max_l1': xt.abs().max().item(),
+                'Training/l1': xt.abs().mean().item(),
                 'epoch': e + 1,
                 'batch': b
             })
