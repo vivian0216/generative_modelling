@@ -24,6 +24,7 @@ def train(model: nn.Module,
           sgld_optimizer = lambda x: torch.optim.SGD(x, lr=1.0),
           sgld_scheduler = lambda x: torch.optim.lr_scheduler.ConstantLR(x, factor=1.0),
           sgld_noise: float = 0.01,
+          sgld_clip: float | None = None, # If not None, clip the data values to -sgld_clip and sgld_clip
           gen_weight: float = 1,
           buffer_size: int = 10000,
           reinit_freq: float = 0.05,         
@@ -52,6 +53,7 @@ def train(model: nn.Module,
     b = 0
     checkpoint_epoch = 0
     checkpoint_batch = 0
+    torch.save(model.state_dict(), f'{model_dir}/checkpoint.pth')
     while e < epochs:      
 
         # Train
@@ -81,7 +83,7 @@ def train(model: nn.Module,
             for t in range(sgld_steps):
 
                 # Save first image in batch
-                if verbose_interval is not None and b % verbose_interval == 0 or loss.item() < -50 and image_dir is not None:
+                if verbose_interval is not None and b % verbose_interval == 0 and image_dir is not None:
                     if t % 10 == 0 or sgld_steps - t < 10: # save every 10 steps or the last 10 steps
                         img = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
                         plt.imshow(img.clip(-1,1) * 0.5 + 0.5)
@@ -102,6 +104,10 @@ def train(model: nn.Module,
                 # Add noise afterwards to complete the iteration, measure change in lr to reuse the scheduler decay
                 lr_last = _sgld_scheduler.get_last_lr()[0]
                 xt.data += (lr_last/lr_init) * sgld_noise * torch.randn_like(xt)
+
+                # Clip the data values
+                if sgld_clip is not None:
+                    xt.data = xt.data.clamp(-sgld_clip, sgld_clip)
 
                 # Decay the step size and noise
                 _sgld_scheduler.step()
