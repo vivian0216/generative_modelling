@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from torchvision import transforms
+from torchmetrics.image.fid import FrechetInceptionDistance
 import numpy as np
 from tqdm import tqdm
 import wandb
@@ -11,6 +13,11 @@ from typing import Callable
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 SHAPE = (1, 28, 28)
+
+def to_fid_format(x: torch.Tensor):
+    x = (0.5 * (x + 1)).clamp(0, 1) # [-1,1] -> [0,1]
+    x = x.repeat(1, 3, 1, 1) # [N,1,28,28] -> [N,3,28,28]
+    return transforms.Resize(299)(x) # [N,3,28,28] -> [N,3,299,299]
 
 # Default values are the ones used in the paper
 def train(model: nn.Module,
@@ -34,7 +41,8 @@ def train(model: nn.Module,
           verbose_interval: int | None = 50,
           model_dir: str = './models',
           image_dir: str | None = None,
-          save_sgld_history: bool = False):
+          save_sgld_history: bool = False,
+          fid_interval: int | None = 25):
 
     if image_dir is not None:
         os.makedirs(image_dir, exist_ok=True)
@@ -47,9 +55,15 @@ def train(model: nn.Module,
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
+    # Initialize FID with distribution of real data
+    if fid_interval is not None:
+        fid = FrechetInceptionDistance(normalize=True, reset_real_features=False).to(device)
+        for x, _ in tqdm(test_dataloader, unit='batch', desc='Pre-computing FID'):
+            x = x.to(device)
+            fid.update(to_fid_format(x), real=True)
+
     # Initialize buffer filled with random samples
     buffer = torch.rand(buffer_size, *SHAPE) * 2 - 1
-
     e = 0 
     b = 0
     checkpoint_epoch = 0
@@ -141,7 +155,7 @@ def train(model: nn.Module,
             model.train()
 
             # get generation loss            
-            xt_logits = model(xt.to(device))
+            xt_logits = model(xt)
             loss_gen = torch.logsumexp(xt_logits, dim=-1) - torch.logsumexp(x_logits, dim=-1)
             loss = loss_clf + gen_weight * loss_gen.mean()
 
@@ -172,7 +186,7 @@ def train(model: nn.Module,
             # log metrics
             energy_real = -torch.logsumexp(x_logits, dim=-1).mean().item()
             energy_fake = -torch.logsumexp(xt_logits, dim=-1).mean().item()
-            wandb.log({
+            metrics = { 
                 'Training/loss_clf': loss_clf.item(),
                 'Training/loss_gen': loss_gen.mean().item(),
                 'Training/loss': loss.item(),
@@ -185,7 +199,13 @@ def train(model: nn.Module,
                 'Training/grad_ratios_minimum': np.min(np.array(ratios)),
                 'epoch': e + 1,
                 'batch': b
-            })
+            }
+            if fid_interval is not None and b % fid_interval == 0:
+                fid.update(to_fid_format(xt.detach()), real=False)
+                fid_score = fid.compute()
+                fid.reset()
+                metrics['Training/fid'] = fid_score
+            wandb.log(metrics)
 
             # save images (of first one in batch)
             if verbose_interval is not None and b % verbose_interval == 0:
@@ -303,7 +323,7 @@ if __name__ == "__main__":
         sgld_steps = 40,
         sgld_noise = 0.01, 
         sgld_optimizer = lambda x: torch.optim.SGD(x, lr=1),
-        sgld_scheduler = lambda x: torch.optim.lr_scheduler.LinearLR(x, start_factor=1, end_factor=0, total_iters=40),
+        sgld_scheduler = lambda x: torch.optim.lr_scheduler.ConstantLR(x, factor=1),
         sgld_clip = None,
         gen_weight = 1,
         buffer_size = 10000,
@@ -316,7 +336,8 @@ if __name__ == "__main__":
         data_fraction = 1,
         train_fraction = 0.8,
         verbose_interval = 50,
-        save_sgld_history = True
+        save_sgld_history = False,
+        fid_interval = 25
     )
         
     # Use 10% of the dataset
@@ -333,8 +354,8 @@ if __name__ == "__main__":
     for k, v in pretty_cfg.items():
         if isinstance(v, Callable):
             pretty_cfg[k] = inspect.getsource(v).split('lambda x: ')[1][:-2]
-    wandb.init(project="generative-modelling", config=pretty_cfg)
-    # wandb.init(project="generative-modelling", config=pretty_cfg, group='MNIST-base')
+    # wandb.init(project="generative-modelling", config=pretty_cfg)
+    wandb.init(project="generative-modelling", config=pretty_cfg, group='MNIST-base-fid')
 
     train(model = model,
           train_dataset = train_dataset,
