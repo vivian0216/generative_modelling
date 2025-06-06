@@ -33,7 +33,8 @@ def train(model: nn.Module,
           checkpoint_interval: int = 1,
           verbose_interval: int | None = 50,
           model_dir: str = './models',
-          image_dir: str | None = None):
+          image_dir: str | None = None,
+          save_sgld_history: bool = False):
 
     if image_dir is not None:
         os.makedirs(image_dir, exist_ok=True)
@@ -80,23 +81,37 @@ def train(model: nn.Module,
             _sgld_scheduler = sgld_scheduler(_sgld_optimizer)
             lr_init = _sgld_scheduler.get_last_lr()[0]
             model.eval() # Disables dropout etc.
+
+            history = dict(imgs=[], energies=[], grads=[])
+            penultimate_grad = None
+            final_grad = None
             for t in range(sgld_steps):
 
+                # compute energy and gradients                 
+                xt_logits = model(xt)
+                energy = -torch.logsumexp(xt_logits, dim=-1)
+                _sgld_optimizer.zero_grad()
+                energy.sum().backward()
+
                 # Save first image in batch
-                if verbose_interval is not None and b % verbose_interval == 0 and image_dir is not None:
+                if verbose_interval is not None and b % verbose_interval == 0:# or loss.abs() > 50 and image_dir is not None:
                     if t % 10 == 0 or sgld_steps - t < 10: # save every 10 steps or the last 10 steps
                         img = xt[0].detach().cpu().numpy().reshape(SHAPE).transpose(1, 2, 0)
                         plt.imshow(img.clip(-1,1) * 0.5 + 0.5)
                         os.makedirs(f'{image_dir}/sgld', exist_ok=True)
                         plt.savefig(f'{image_dir}/sgld/epoch_{e+1}_batch_{b}_step_{t}.png')
                         plt.close()
-                
-                # compute gradients                 
-                xt_logits = model(xt)
-                energy = -torch.logsumexp(xt_logits, dim=-1)
-                _sgld_optimizer.zero_grad()
-                energy.sum().backward()
-                
+                    if save_sgld_history:
+                        history['imgs'].append(xt.detach().cpu().numpy())
+                        history['energies'].append(energy.detach().cpu().numpy())
+                        history['grads'].append(xt.grad.detach().cpu().numpy())
+
+                # Save last two gradients
+                if t == sgld_steps - 2:
+                    penultimate_grad = xt.grad.detach().cpu().numpy()
+                elif t == sgld_steps - 1:
+                    final_grad = xt.grad.detach().cpu().numpy()
+                                
                 # Do gradient step to minimize the energy using the optimizer
                 # Equivalent to maximizing the logsumexp as in the paper's pseudocode
                 _sgld_optimizer.step()
@@ -111,6 +126,17 @@ def train(model: nn.Module,
 
                 # Decay the step size and noise
                 _sgld_scheduler.step()
+            xt = xt.detach()
+
+            # Measure direction switch of last two gradients
+            ratios = []
+            for i in range(len(final_grad)):
+                dot = (final_grad[i] * penultimate_grad[i]).sum()
+                ratios.append(dot / np.linalg.norm(penultimate_grad[i])**2)
+
+            if save_sgld_history and len(history['imgs']) > 0:
+                os.makedirs(f'{image_dir}/sgld_history', exist_ok=True)
+                np.savez(f'{image_dir}/sgld_history/epoch_{e+1}_batch_{b}_steps_{sgld_steps}.npz', **history)
 
             model.train()
 
@@ -154,6 +180,9 @@ def train(model: nn.Module,
                 'Training/energy_real': energy_real,
                 'Training/energy_fake': energy_fake,
                 'Training/l1': xt.abs().mean().item(),
+                'Training/grad_ratios': np.mean(ratios),
+                'Training/grad_ratios_below_minus_one': np.mean(np.array(ratios) < -1),
+                'Training/grad_ratios_minimum': np.min(np.array(ratios)),
                 'epoch': e + 1,
                 'batch': b
             })
@@ -273,8 +302,9 @@ if __name__ == "__main__":
         # SGLD parameters
         sgld_steps = 40,
         sgld_noise = 0.01, 
-        sgld_optimizer = lambda x: torch.optim.SGD(x, lr=1.0),
-        sgld_scheduler = lambda x: torch.optim.lr_scheduler.ConstantLR(x, factor=1.0),
+        sgld_optimizer = lambda x: torch.optim.SGD(x, lr=1),
+        sgld_scheduler = lambda x: torch.optim.lr_scheduler.LinearLR(x, start_factor=1, end_factor=0, total_iters=40),
+        sgld_clip = None,
         gen_weight = 1,
         buffer_size = 10000,
         reinit_freq = 0.05,
@@ -285,7 +315,8 @@ if __name__ == "__main__":
         checkpoint_interval = 1,
         data_fraction = 1,
         train_fraction = 0.8,
-        verbose_interval = 50
+        verbose_interval = 50,
+        save_sgld_history = True
     )
         
     # Use 10% of the dataset
@@ -303,6 +334,7 @@ if __name__ == "__main__":
         if isinstance(v, Callable):
             pretty_cfg[k] = inspect.getsource(v).split('lambda x: ')[1][:-2]
     wandb.init(project="generative-modelling", config=pretty_cfg)
+    # wandb.init(project="generative-modelling", config=pretty_cfg, group='MNIST-base')
 
     train(model = model,
           train_dataset = train_dataset,
