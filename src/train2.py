@@ -7,6 +7,13 @@ import wandb
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import os
+import argparse
+
+from torch.utils.data import random_split
+from torchvision.datasets import MNIST, CIFAR10
+from torchvision import transforms
+from torchvision import models
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f'Using device: {device}')
 
@@ -98,59 +105,71 @@ def train(model: nn.Module,
                     buffer_batch = random.choice(buffer)
                     idx = np.random.randint(buffer_batch.shape[0])
                     xt[i] = buffer_batch[idx].clone()
+                    
+            # Default values when energy block is disabled
+            loss_gen = torch.tensor(0.0, device=device)
+            xt = torch.zeros_like(x)  # placeholder just to keep dimensions consistent
+            xt_logits = None
+            xt_logsumexp = torch.tensor(0.0, device=device)
+            loss = loss_clf  # No generation loss
 
-            # perform SGLD with gradient clipping to prevent explosions
-            for t in range(steps):
-                xt = xt.clone().detach().requires_grad_(True).to(device)
-                xt_logits = model(xt)
-                logsumexp = torch.logsumexp(xt_logits, dim=-1)
-                
-                # compute gradients
-                logsumexp.sum().backward()
-                
-                # Clip gradients to prevent extreme values - FIX APPLIED HERE
-                grad = xt.grad
-                
-                # Calculate the norm properly across all dimensions except batch
-                # For CIFAR (B, 3, 32, 32) or MNIST (B, 1, 28, 28)
-                grad_norm = torch.norm(grad.view(grad.shape[0], -1), dim=1)
-                
-                # Reshape gradient norm to match batch dimension for comparison
-                grad_norm = grad_norm.view(grad.shape[0], 1, 1, 1)
-                
-                # Create the mask for values that are too large
-                too_large = grad_norm > 10.0
-                
-                # Apply the mask and rescale gradients
-                if too_large.any():
-                    # The mask broadcasting will now work correctly
-                    scale_factor = 10.0 / grad_norm
-                    scale_factor[~too_large] = 1.0
-                    grad = grad * scale_factor
+            if gen_weight > 0 and steps > 0:
+                # perform SGLD with gradient clipping to prevent explosions
+                for t in range(steps):
+                    xt = xt.clone().detach().requires_grad_(True).to(device)
+                    xt_logits = model(xt)
+                    logsumexp = torch.logsumexp(xt_logits, dim=-1)
+                    
+                    # compute gradients
+                    logsumexp.sum().backward()
+                    
+                    # Clip gradients to prevent extreme values - FIX APPLIED HERE
+                    grad = xt.grad
+                    
+                    # Calculate the norm properly across all dimensions except batch
+                    # For CIFAR (B, 3, 32, 32) or MNIST (B, 1, 28, 28)
+                    grad_norm = torch.norm(grad.view(grad.shape[0], -1), dim=1)
+                    
+                    # Reshape gradient norm to match batch dimension for comparison
+                    grad_norm = grad_norm.view(grad.shape[0], 1, 1, 1)
+                    
+                    # Create the mask for values that are too large
+                    too_large = grad_norm > 10.0
+                    
+                    # Apply the mask and rescale gradients
+                    if too_large.any():
+                        # The mask broadcasting will now work correctly
+                        scale_factor = 10.0 / grad_norm
+                        scale_factor[~too_large] = 1.0
+                        grad = grad * scale_factor
 
-                # do step manually with gradient clipping
-                with torch.no_grad():
-                    xt = xt + step_size * grad + noise * torch.randn_like(xt)
-                    # Ensure xt stays in valid range to prevent extreme values
-                    xt.clamp_(-1.0, 1.0)
+                    # do step manually with gradient clipping
+                    with torch.no_grad():
+                        xt = xt + step_size * grad + noise * torch.randn_like(xt)
+                        # Ensure xt stays in valid range to prevent extreme values
+                        xt.clamp_(-1.0, 1.0)
 
-            # get generation loss with safeguards
-            xt_logits = model(xt.to(device))
+                # get generation loss with safeguards
+                xt_logits = model(xt.to(device))
+                
+                # Apply numerical stability tricks
+                x_logsumexp = torch.logsumexp(x_logits, dim=-1)
+                xt_logsumexp = torch.logsumexp(xt_logits, dim=-1)
+                
+                # Clip values to prevent extreme differences
+                diff = xt_logsumexp - x_logsumexp
+                diff = torch.clamp(diff, -100, 100)
+                loss_gen = diff.mean()
             
-            # Apply numerical stability tricks
-            x_logsumexp = torch.logsumexp(x_logits, dim=-1)
-            xt_logsumexp = torch.logsumexp(xt_logits, dim=-1)
-            
-            # Clip values to prevent extreme differences
-            diff = xt_logsumexp - x_logsumexp
-            diff = torch.clamp(diff, -100, 100)
-            loss_gen = diff.mean()
-            
-            # Weighted combined loss with scaled gen_weight
-            # Start with smaller gen_weight and increase gradually
-            effective_gen_weight = gen_weight * min(1.0, (e + 1) / 10)
-            loss = loss_clf + effective_gen_weight * loss_gen
-
+                # Weighted combined loss with scaled gen_weight
+                # Start with smaller gen_weight and increase gradually
+                effective_gen_weight = gen_weight * min(1.0, (e + 1) / 10)
+                loss = loss_clf + effective_gen_weight * loss_gen
+            else:
+                # If gen_weight is 0 or steps is 0, we only use classification loss
+                effective_gen_weight = 0.0
+                loss = loss_clf
+                
             # If the loss is getting too large, skip this batch
             if not torch.isfinite(loss) or loss.abs() > 1e8:
                 print(f'Loss exploded at batch {batch_idx}: {loss.item()}, skipping')
@@ -193,9 +212,13 @@ def train(model: nn.Module,
             gen_losses.append(loss_gen.item())
             combined_losses.append(loss.item())
             accs.append((torch.argmax(x_logits, dim=-1) == y).detach().cpu().numpy().mean())
-            energies_real.append(-x_logsumexp.mean().item())
-            energies_fake.append(-xt_logsumexp.mean().item())
-
+            if gen_weight > 0 and steps > 0:
+                energies_real.append(-x_logsumexp.mean().item())
+                energies_fake.append(-xt_logsumexp.mean().item())
+            else:
+                energies_real.append(0.0)
+                energies_fake.append(0.0)
+                
             pbar.set_postfix({
                 'clf_loss': np.mean(clf_losses[-50:]),  # Show average of last 50 batches
                 'gen_loss': np.mean(gen_losses[-50:]),
@@ -336,12 +359,6 @@ class WideResNet(nn.Module):
         return self.model(x)
 
 if __name__ == "__main__":
-
-    from torchvision.datasets import MNIST, CIFAR10
-    from torchvision import transforms
-    from torchvision import models
-    import argparse
-
     parser = argparse.ArgumentParser(description='JEM Training')
     parser.add_argument('--dataset', type=str, default='mnist', choices=['mnist', 'cifar10'],
                         help='dataset to use (default: mnist)')
@@ -357,14 +374,20 @@ if __name__ == "__main__":
     
     if args.dataset == 'mnist':
         print("Using MNIST dataset")
-        full_dataset = MNIST(root='./data', train=True, download=True, transform=transforms.Compose([
+        # Define transformations
+        transform = transforms.Compose([
             transforms.ToTensor(),
-            transforms.Lambda(lambda x: x * 2 - 1)
-        ]))
-        test_full_dataset = MNIST(root='./data', train=False, download=True, transform=transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x * 2 - 1)
-        ]))
+            transforms.Lambda(lambda x: x * 2 - 1)  # Scale to [-1, 1]
+        ])
+
+        # Load the full MNIST training dataset (60,000 samples)
+        full_dataset = MNIST(root='./data', train=True, download=True, transform=transform)
+
+        # Split into 80% training, 20% test
+        train_size = int(0.8 * len(full_dataset))  
+        test_size = len(full_dataset) - train_size  
+        train_dataset, test_dataset = random_split(full_dataset, [train_size, test_size])
+
         input_channels = 1
     else:
         print("Using CIFAR10 dataset")
@@ -395,12 +418,12 @@ if __name__ == "__main__":
             step_size = 0.5,  # Lower step size for MNIST
             noise = 0.01, 
             buffer_size = 1000,
-            steps = 20,
+            steps = 20,              # For basic CNN, we can set steps to 0. This means we will not perform SGLD, just use the initial noise
             reinit_freq = 0.05,
-            epochs = 150,
+            epochs = 26,
             batch_size = 50,
             learning_rate = 1e-4,
-            gen_weight = 0.5,  # Lower gen_weight for stability
+            gen_weight = 0.1,       # For basic CNN, set this to 0 so that we don't have the energy block
             learning_rate_decay = 0.3,
             learning_rate_epochs = 50,
             data_fraction = 1.0,  # Use full training set
@@ -429,12 +452,7 @@ if __name__ == "__main__":
         train_size = int(len(full_dataset) * data_fraction)
         indices = np.random.RandomState(seed=42).permutation(len(full_dataset))[:train_size]
         train_dataset = torch.utils.data.Subset(full_dataset, indices)
-    else:
-        train_dataset = full_dataset
         
-    # Use the full test dataset
-    test_dataset = test_full_dataset
-    
     wandb.init(project=f"jem-{args.dataset}", config=cfg)
 
     train(model = model,

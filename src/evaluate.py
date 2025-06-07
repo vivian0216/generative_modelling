@@ -144,54 +144,58 @@ if __name__ == "__main__":
     out_dim = 10
     SHAPE = (1, 28, 28)
     jem_model = CNN(out_dim)
+    base_model = CNN(out_dim)
     
     # Load model weights and move to device
     jem_model.load_state_dict(torch.load('models/jem/mnist-run-3.pth', map_location=device))
     jem_model.to(device)
+    
+    base_model.load_state_dict(torch.load('models/cnn/model.pth', map_location=device))
+    base_model.to(device)
 
     # ------------------------------------------------------------------------------------------------------------------------
     # Evaluate accuracy
     # ------------------------------------------------------------------------------------------------------------------------
-    # accuracy = evaluate_model(jem_model, dataloader)
-    # logger.info(f"Accuracy of pretrained jem model: {accuracy * 100:.2f}%")
+    accuracy = evaluate_model(base_model, dataloader)
+    logger.info(f"Accuracy of pretrained base model: {accuracy}")
     
     #------------------------------------------------------------------------------------------------------------------------
     # FID Calculation
     #------------------------------------------------------------------------------------------------------------------------
     # Generate samples
-    fake_raw = generate_samples(jem_model, num_samples=10000)
+    # fake_raw = generate_samples(jem_model, num_samples=10000)
     
-    # Convert to RGB and resize
-    fake_images = convert_to_rgb_and_resize(fake_raw)
-    logger.info(f"Generated {len(fake_images)} samples with shape {fake_images.shape}.")
+    # # Convert to RGB and resize
+    # fake_images = convert_to_rgb_and_resize(fake_raw)
+    # logger.info(f"Generated {len(fake_images)} samples with shape {fake_images.shape}.")
     
-    # Save some samples for visualization
-    save_images(fake_images, folder="generated_images_rgb", color=True)
-    logger.info(f"Generated {len(fake_images)} samples and saved to 'generated_images_rgb' folder.")
+    # # Save some samples for visualization
+    # save_images(fake_images, folder="generated_images_rgb", color=True)
+    # logger.info(f"Generated {len(fake_images)} samples and saved to 'generated_images_rgb' folder.")
     
-    # Prepare real images (already transformed to 3-channel during dataset loading)
-    transform_fid = transforms.Compose([
-        transforms.Resize(299),
-        transforms.Grayscale(num_output_channels=3),
-        transforms.ToTensor(),  # This automatically converts to [0,1] and float32
-        transforms.Lambda(lambda x: (x * 255).type(torch.uint8))  # Convert to uint8
-    ])
+    # # Prepare real images (already transformed to 3-channel during dataset loading)
+    # transform_fid = transforms.Compose([
+    #     transforms.Resize(299),
+    #     transforms.Grayscale(num_output_channels=3),
+    #     transforms.ToTensor(),  # This automatically converts to [0,1] and float32
+    #     transforms.Lambda(lambda x: (x * 255).type(torch.uint8))  # Convert to uint8
+    # ])
     
-    real_dataset = MNIST(root='./data', train=True, download=True, transform=transform_fid)
-    real_loader = DataLoader(real_dataset, batch_size=64)
+    # real_dataset = MNIST(root='./data', train=True, download=True, transform=transform_fid)
+    # real_loader = DataLoader(real_dataset, batch_size=64)
     
-    # FID calculation
-    fid = FrechetInceptionDistance(feature=2048).to(device)
+    # # FID calculation
+    # fid = FrechetInceptionDistance(feature=2048).to(device)
     
-    # Real images
-    for batch in real_loader:
-        imgs = batch[0].to(device)
-        fid.update(imgs, real=True)
+    # # Real images
+    # for batch in real_loader:
+    #     imgs = batch[0].to(device)
+    #     fid.update(imgs, real=True)
 
-    # Fake images
-    fake_loader = DataLoader(fake_images, batch_size=64)
-    for batch in fake_loader:
-        fid.update(batch.to(device), real=False)
+    # # Fake images
+    # fake_loader = DataLoader(fake_images, batch_size=64)
+    # for batch in fake_loader:
+    #     fid.update(batch.to(device), real=False)
 
-    fid_score = fid.compute()
-    logger.info(f"FID score: {fid_score.item():.2f}")
+    # fid_score = fid.compute()
+    # logger.info(f"FID score: {fid_score.item():.2f}")
