@@ -302,9 +302,10 @@ def train(model: nn.Module,
             'epoch': e
         })
         e += 1
+        model.train()
 
     # Save final model
-    model_path = f'{model_dir}/final_mnist_from_train2.pth'
+    model_path = f'{model_dir}/mnist-run-3.pth'
     torch.save(model.state_dict(), model_path)
     print(f'Saved final model to {os.path.abspath(model_path)}')
 
@@ -399,7 +400,7 @@ if __name__ == "__main__":
             buffer_size = 1000,
             steps = 20,
             reinit_freq = 0.05,
-            epochs = 50,
+            epochs = 20,
             batch_size = 50,
             learning_rate = 1e-4,
             gen_weight = 1,  # Lower gen_weight for stability
