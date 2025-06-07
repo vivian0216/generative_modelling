@@ -423,7 +423,7 @@ if __name__ == "__main__":
             epochs = 26,
             batch_size = 50,
             learning_rate = 1e-4,
-            gen_weight = 0.1,       # For basic CNN, set this to 0 so that we don't have the energy block
+            gen_weight = 1,       # For basic CNN, set this to 0 so that we don't have the energy block
             learning_rate_decay = 0.3,
             learning_rate_epochs = 50,
             data_fraction = 1.0,  # Use full training set
