@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from torchvision.datasets import MNIST
 from torchvision import transforms
 import pandas as pd
-import foolbox as fb
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--n_steps_refine', type=int, default=0)
@@ -130,23 +129,6 @@ class BaselineCNN(nn.Module):
         pred = logits.max(1)[1]
         return pred
 
-class gradient_attack_wrapper(nn.Module):
-    def __init__(self, model, is_baseline=False):
-        super(gradient_attack_wrapper, self).__init__()
-        self.model = model.eval()
-        self.is_baseline = is_baseline
-
-    def forward(self, x):
-        x.requires_grad_()
-        if self.is_baseline:
-            out = self.model(x)
-        else:
-            out = self.model.refined_logits(x)
-        return out
-
-    def eval(self):
-        return self.model.eval()
-
 class DummyModel(nn.Module):
     def __init__(self, f, n_steps_refine=0):
         super(DummyModel, self).__init__()
@@ -175,10 +157,7 @@ class DummyModel(nn.Module):
         return logits
 
     def classify(self, x):
-        if self.n_steps_refine == 0:
-            logits = self.logits(x)
-        else:
-            logits = self.refined_logits(x)
+        logits = self.logits(x)
         pred = logits.max(1)[1]
         return pred
 
@@ -217,6 +196,101 @@ class DummyModel(nn.Module):
 
     def logp_grad_score(self, x):
         return -self.grad_norm(x)
+
+# Custom PGD Attack Implementation
+class CustomPGDAttack:
+    def __init__(self, model, eps, alpha, steps, norm='Linf', random_start=True, is_baseline=False):
+        """
+        Custom PGD Attack
+        
+        Args:
+            model: The model to attack
+            eps: Maximum perturbation magnitude
+            alpha: Step size
+            steps: Number of PGD steps
+            norm: 'Linf' or 'L2'
+            random_start: Whether to start with random noise
+            is_baseline: Whether the model is baseline CNN
+        """
+        self.model = model
+        self.eps = eps
+        self.alpha = alpha
+        self.steps = steps
+        self.norm = norm
+        self.random_start = random_start
+        self.is_baseline = is_baseline
+        
+    def project(self, x, x_orig):
+        """Project perturbation to norm ball"""
+        if self.norm == 'Linf':
+            x = torch.max(torch.min(x, x_orig + self.eps), x_orig - self.eps)
+        elif self.norm == 'L2':
+            delta = x - x_orig
+            delta_norms = torch.norm(delta.view(delta.shape[0], -1), p=2, dim=1)
+            factor = torch.min(torch.ones_like(delta_norms), self.eps / (delta_norms + 1e-12))
+            delta = delta * factor.view(-1, 1, 1, 1)
+            x = x_orig + delta
+        
+        # Clip to valid input range [-1, 1]
+        x = torch.clamp(x, -1, 1)
+        return x
+    
+    def attack(self, x, y):
+        """
+        Perform PGD attack
+        
+        Args:
+            x: Input images
+            y: True labels
+            
+        Returns:
+            x_adv: Adversarial examples
+        """
+        if self.eps == 0:
+            return x
+            
+        x_adv = x.clone().detach()
+        
+        # Random initialization
+        if self.random_start and self.eps > 0:
+            if self.norm == 'Linf':
+                noise = torch.empty_like(x_adv).uniform_(-self.eps, self.eps)
+            elif self.norm == 'L2':
+                noise = torch.randn_like(x_adv)
+                noise_norms = torch.norm(noise.view(noise.shape[0], -1), p=2, dim=1)
+                noise = noise / (noise_norms.view(-1, 1, 1, 1) + 1e-12) * self.eps * torch.rand(x.shape[0], device=x.device).view(-1, 1, 1, 1)
+            
+            x_adv = x_adv + noise
+            x_adv = self.project(x_adv, x)
+        
+        # PGD iterations
+        for i in range(self.steps):
+            x_adv.requires_grad_(True)
+            
+            # Get logits
+            if self.is_baseline:
+                logits = self.model(x_adv)
+            else:
+                logits = self.model.refined_logits(x_adv)
+            
+            # Compute loss
+            loss = F.cross_entropy(logits, y)
+            
+            # Compute gradients
+            grad = torch.autograd.grad(loss, x_adv, retain_graph=False, create_graph=False)[0]
+            
+            # Update adversarial examples
+            if self.norm == 'Linf':
+                x_adv = x_adv.detach() + self.alpha * grad.sign()
+            elif self.norm == 'L2':
+                grad_norms = torch.norm(grad.view(grad.shape[0], -1), p=2, dim=1) + 1e-12
+                grad = grad / grad_norms.view(-1, 1, 1, 1)
+                x_adv = x_adv.detach() + self.alpha * grad
+            
+            # Project back to norm ball
+            x_adv = self.project(x_adv, x)
+        
+        return x_adv.detach()
 
 # Load the test dataset
 test_dataset = MNIST(root='./data', train=False, download=True,
@@ -261,27 +335,19 @@ def evaluate_clean_accuracy(model, test_loader, device, model_name, is_baseline=
     print(f"{model_name} clean accuracy: {accuracy:.2f}%")
     return accuracy
 
-# Function to run adversarial attacks
+# Function to run adversarial attacks using custom PGD
 def run_adversarial_attacks(model, test_loader, device, model_name, distance_type='Linf', is_baseline=False):
     print(f"\nRunning {distance_type} attacks on {model_name}...")
     
-    # Wrap model for Foolbox
-    model_wrapped = gradient_attack_wrapper(model, is_baseline=is_baseline)
-    fmodel = fb.models.PyTorchModel(model_wrapped, bounds=(-1., 1.), device=device)
-    
-    # Define epsilon values to test
+    # Define epsilon values and step sizes
     if distance_type == 'L2':
         epsilons = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
-        attack = fb.attacks.L2ProjectedGradientDescentAttack(
-            steps=args.n_steps_pgd_attack,
-            random_start=not args.no_random_start
-        )
+        # Step size as fraction of epsilon
+        alpha_ratio = 0.1
     else:  # Linf
         epsilons = [0.0, 0.01, 0.03, 0.05, 0.1, 0.15, 0.2, 0.3]
-        attack = fb.attacks.LinfProjectedGradientDescentAttack(
-            steps=args.n_steps_pgd_attack,
-            random_start=not args.no_random_start
-        )
+        # Step size as fraction of epsilon
+        alpha_ratio = 0.1
     
     # Store results for each epsilon
     epsilon_results = {}
@@ -291,6 +357,20 @@ def run_adversarial_attacks(model, test_loader, device, model_name, distance_typ
         correct = 0
         total = 0
         
+        # Calculate step size
+        alpha = epsilon * alpha_ratio if epsilon > 0 else 0
+        
+        # Create attack instance
+        attack = CustomPGDAttack(
+            model=model,
+            eps=epsilon,
+            alpha=alpha,
+            steps=args.n_steps_pgd_attack,
+            norm=distance_type,
+            random_start=not args.no_random_start,
+            is_baseline=is_baseline
+        )
+        
         for batch_idx, (data, target) in enumerate(test_loader):
             if args.start_batch != -1 and batch_idx < args.start_batch:
                 continue
@@ -299,32 +379,23 @@ def run_adversarial_attacks(model, test_loader, device, model_name, distance_typ
                 
             data, target = data.to(device), target.to(device)
             
-            # Skip if epsilon is 0 (clean accuracy)
-            if epsilon == 0.0:
+            try:
+                # Generate adversarial examples
+                adv_data = attack.attack(data, target)
+                
+                # Evaluate on adversarial examples
+                model.eval()
                 with torch.no_grad():
                     if is_baseline:
-                        pred = model.classify(data)
+                        pred = model.classify(adv_data)
                     else:
-                        pred = model.classify(data)
+                        pred = model.classify(adv_data)
                     correct += (pred == target).sum().item()
                     total += target.size(0)
-            else:
-                # Generate adversarial examples
-                try:
-                    _, adversarials, success = attack(fmodel, data, target, epsilons=epsilon)
                     
-                    # Evaluate on adversarial examples
-                    with torch.no_grad():
-                        if is_baseline:
-                            pred = model.classify(adversarials)
-                        else:
-                            pred = model.classify(adversarials)
-                        correct += (pred == target).sum().item()
-                        total += target.size(0)
-                        
-                except Exception as e:
-                    print(f"    Error in attack for epsilon {epsilon}: {e}")
-                    continue
+            except Exception as e:
+                print(f"    Error in attack for epsilon {epsilon}: {e}")
+                continue
             
             if args.debug and batch_idx % 10 == 0:
                 current_acc = 100. * correct / total if total > 0 else 0
