@@ -19,7 +19,7 @@ parser.add_argument('--threshold', type=float, default=.7)
 parser.add_argument('--debug',  action='store_true')
 parser.add_argument('--no_random_start',  action='store_true')
 parser.add_argument("--load_path", type=str, default=None)
-parser.add_argument("--distance", type=str, default='Linf')
+parser.add_argument("--distance", type=str, default='both')
 parser.add_argument("--n_steps_pgd_attack", type=int, default=40)
 parser.add_argument("--start_batch", type=int, default=-1)
 parser.add_argument("--end_batch", type=int, default=10)
@@ -341,11 +341,11 @@ def run_adversarial_attacks(model, test_loader, device, model_name, distance_typ
     
     # Define epsilon values and step sizes
     if distance_type == 'L2':
-        epsilons = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+        epsilons = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0]
         # Step size as fraction of epsilon
         alpha_ratio = 0.1
     else:  # Linf
-        epsilons = [0.0, 0.01, 0.03, 0.05, 0.1, 0.15, 0.2, 0.3]
+        epsilons = [0.0, 0.01, 0.03, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 1.0]
         # Step size as fraction of epsilon
         alpha_ratio = 0.1
     
@@ -451,6 +451,10 @@ def load_and_create_models():
         jem_10 = DummyModel(ccf_model, n_steps_refine=10)
         models['JEM (10 steps)'] = (jem_10, False)
         
+        # JEM with 25 refinement steps
+        jem_25 = DummyModel(ccf_model, n_steps_refine=25)
+        models['JEM (25 steps)'] = (jem_25, False)
+        
         print("✓ JEM models loaded successfully")
         
     except FileNotFoundError:
@@ -483,7 +487,7 @@ for model_name, (model, is_baseline) in models.items():
     if args.distance == 'Linf' or args.distance == 'both':
         linf_results = run_adversarial_attacks(model, test_loader, device, model_name, 'Linf', is_baseline)
     
-    # Run L2 attacks
+    # Run L2 attacks  
     if args.distance == 'L2' or args.distance == 'both':
         l2_results = run_adversarial_attacks(model, test_loader, device, model_name, 'L2', is_baseline)
 
@@ -494,11 +498,57 @@ print("FINAL RESULTS")
 print("="*80)
 print(results_df.to_string(index=False))
 
-# Save results
+# Save results in multiple formats for easy plotting
 os.makedirs(args.base_dir, exist_ok=True)
+
+# 1. Save complete results CSV
 results_path = os.path.join(args.base_dir, f"{args.exp_name}_comparative_adversarial_results.csv")
 results_df.to_csv(results_path, index=False)
-print(f"\nResults saved to: {results_path}")
+print(f"\nComplete results saved to: {results_path}")
+
+# 2. Create separate CSV files for each norm (optimized for line plotting)
+attack_types = results_df[results_df['Attack'] != 'Clean']['Attack'].unique()
+
+for attack_type in attack_types:
+    attack_data = results_df[results_df['Attack'] == attack_type]
+    
+    # Create pivot table for easy plotting
+    pivot_table = attack_data.pivot(index='Epsilon', columns='Model', values='Adversarial Accuracy (%)')
+    
+    # Save pivot table
+    norm_name = attack_type.replace('-PGD', '')
+    pivot_path = os.path.join(args.base_dir, f"{args.exp_name}_{norm_name}_results_for_plotting.csv")
+    pivot_table.to_csv(pivot_path)
+    print(f"{norm_name} results for plotting saved to: {pivot_path}")
+
+# 3. Create a summary file with clean accuracies
+clean_data = results_df[results_df['Attack'] == 'Clean'][['Model', 'Adversarial Accuracy (%)']].copy()
+clean_data.columns = ['Model', 'Clean Accuracy (%)']
+clean_path = os.path.join(args.base_dir, f"{args.exp_name}_clean_accuracies.csv")
+clean_data.to_csv(clean_path, index=False)
+print(f"Clean accuracies saved to: {clean_path}")
+
+# 4. Create a plotting-ready long format CSV
+plot_data = []
+for attack_type in attack_types:
+    attack_data = results_df[results_df['Attack'] == attack_type]
+    for _, row in attack_data.iterrows():
+        plot_data.append({
+            'Model': row['Model'],
+            'Norm': attack_type.replace('-PGD', ''),
+            'Epsilon': row['Epsilon'],
+            'Accuracy': row['Adversarial Accuracy (%)']
+        })
+
+plot_df = pd.DataFrame(plot_data)
+plot_path = os.path.join(args.base_dir, f"{args.exp_name}_plotting_data.csv")
+plot_df.to_csv(plot_path, index=False)
+print(f"Plotting-ready data saved to: {plot_path}")
+
+print(f"\n📊 Files created for easy plotting:")
+print(f"   • Line plots by norm: {args.exp_name}_[Linf/L2]_results_for_plotting.csv")
+print(f"   • Combined plotting data: {args.exp_name}_plotting_data.csv")
+print(f"   • Clean accuracies: {args.exp_name}_clean_accuracies.csv")
 
 # Print comparative analysis
 print("\n" + "="*50)
