@@ -173,6 +173,7 @@ class DummyModel(nn.Module):
     def logp_grad_score(self, x):
         return -self.grad_norm(x)
 
+# Load model
 dict = torch.load('mnist-run-4.pth', map_location=device)
 print("Model loaded with keys:", dict.keys())
 
@@ -183,19 +184,6 @@ f.load_state_dict(torch.load('mnist-run-4.pth', map_location=device))
 f = DummyModel(f)
 model = f.to(device)
 model.eval()
-labels = torch.arange(0, 10).to(device)
-criterion = fb.criteria.Misclassification(labels)
-
-model_wrapped = gradient_attack_wrapper(model)
-fmodel = fb.models.PyTorchModel(model_wrapped, bounds=(0., 1.), device=device)
-
-if args.distance == 'L2':
-    distance = fb.distances.LpDistance(p=2)
-    attack = fb.attacks.L2BasicIterativeAttack()
-else:
-    # Linf
-    distance = fb.distances.LpDistance(p=float('inf'))
-    attack = fb.attacks.LinfProjectedGradientDescentAttack(random_start=True)
 
 # Load the test dataset
 test_dataset = MNIST(root='./data', train=False, download=True,
@@ -211,140 +199,144 @@ test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=100, shuffle=
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Load the baseline CNN model
-# baseline_model = CNN(out_dim=10)  # MNIST has 10 classes
-# baseline_model.load_state_dict(torch.load('./models/baseline_model.pth', map_location=device))
-# baseline_model.to(device)
-# baseline_model.eval()
+# Function to evaluate clean accuracy
+def evaluate_clean_accuracy(model, test_loader, device):
+    correct = 0
+    total = 0
+    model.eval()
+    
+    with torch.no_grad():
+        for batch_idx, (data, target) in enumerate(test_loader):
+            if args.start_batch != -1 and batch_idx < args.start_batch:
+                continue
+            if args.end_batch != -1 and batch_idx >= args.end_batch:
+                break
+                
+            data, target = data.to(device), target.to(device)
+            
+            # Get predictions
+            pred = model.classify(data)
+            correct += (pred == target).sum().item()
+            total += target.size(0)
+    
+    accuracy = 100. * correct / total
+    print(f"Clean accuracy: {accuracy:.2f}%")
+    return accuracy
 
-# # Load the JEM-0 model (no sampling)
-# jem_base = CNN(out_dim=10)
-# jem_base.load_state_dict(torch.load('mnist-run-3.pth', map_location=device))
-# jem_base.to(device)
-# jem_base.eval()
-
-# jem0_model = JEMWrapper(jem_base, num_steps=0, step_size=0.5, noise_std=0.01, eot_samples=1)
-# jem1_model = JEMWrapper(jem_base, num_steps=1, step_size=0.5, noise_std=0.01, eot_samples=1)
-# jem10_model = JEMWrapper(jem_base, num_steps=10, step_size=0.5, noise_std=0.01, eot_samples=1)
-
-# # Create foolbox model for baseline
-# fmodel_baseline = fb.PyTorchModel(baseline_model, bounds=(-1, 1))
-
-# # Create foolbox models for JEM variants
-# fmodel_jem0 = fb.PyTorchModel(jem0_model, bounds=(-1, 1))
-# fmodel_jem1 = fb.PyTorchModel(jem1_model, bounds=(-1, 1))
-# fmodel_jem10 = fb.PyTorchModel(jem10_model, bounds=(-1, 1))
-
-# print("Models loaded successfully!")
-# print(f"Test dataset size: {len(test_dataset)}")
-
-
-
-# Function to compute accuracy
-# def compute_accuracy(model, dataloader):
-#     correct = 0
-#     total = 0
-#     for images, labels in dataloader:
-#         images = torch.tensor(images, requires_grad=True).to(device)
-#         labels = labels.to(device)
-#         outputs = model(images)
-#         _, predicted = torch.max(outputs, 1)
-#         total += labels.size(0)
-#         correct += (predicted == labels).sum().item()
-#     return 100 * correct / total
-
-# # Compute and print accuracies
-# baseline_accuracy = compute_accuracy(baseline_model, test_loader)
-# jem0_accuracy = compute_accuracy(jem0_model, test_loader)
-# jem1_accuracy = compute_accuracy(jem1_model, test_loader)
-# jem10_accuracy = compute_accuracy(jem10_model, test_loader)
-
-# print(f"Baseline model accuracy: {baseline_accuracy:.2f}%")
-# print(f"JEM0 model accuracy: {jem0_accuracy:.2f}%")
-# print(f"JEM1 model accuracy: {jem1_accuracy:.2f}%")
-# print(f"JEM10 model accuracy: {jem10_accuracy:.2f}%")
-
-# # Get a batch of test images and labels
-# test_iter = iter(test_loader)
-# images, labels = next(test_iter)
-# images, labels = images.to(device), labels.to(device)
-
-
-# linf_attack = fb.attacks.LinfPGD()
-# linf_epsilons = [0.1, 0.2, 0.3, 0.4]  # Typical range for L-inf
-# l2_attack = fb.attacks.L2PGD()
-# l2_epsilons = [1.0, 2.0, 3.0, 4.0]  # Typical range for L2
-
-# def run_attacks(fmodel, model_name, images, labels, linf_epsilons = [0.1, 0.2, 0.3, 0.4], l2_epsilons = [1.0, 2.0, 3.0, 4.0], sampling_steps=0):
-
-#     # L-infinity PGD attack
-#     print(f"\nL-infinity PGD Attack Results on {model_name} Model:")
-#     for eps in linf_epsilons:
-#         _, adversarial, success = linf_attack(fmodel, images, labels, epsilons=eps)
+# Function to run adversarial attacks
+def run_adversarial_attacks(model, test_loader, device, distance_type='Linf'):
+    print(f"\nRunning {distance_type} attacks...")
+    
+    # Wrap model for Foolbox
+    model_wrapped = gradient_attack_wrapper(model)
+    fmodel = fb.models.PyTorchModel(model_wrapped, bounds=(-1., 1.), device=device)
+    
+    # Define epsilon values to test
+    if distance_type == 'L2':
+        epsilons = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+        attack = fb.attacks.L2ProjectedGradientDescentAttack(
+            steps=args.n_steps_pgd_attack,
+            random_start=not args.no_random_start
+        )
+    else:  # Linf
+        epsilons = [0.0, 0.01, 0.03, 0.05, 0.1, 0.15, 0.2, 0.3]
+        attack = fb.attacks.LinfProjectedGradientDescentAttack(
+            steps=args.n_steps_pgd_attack,
+            random_start=not args.no_random_start
+        )
+    
+    # Store results for each epsilon
+    epsilon_results = {}
+    
+    for epsilon in epsilons:
+        print(f"\nTesting epsilon = {epsilon}")
+        correct = 0
+        total = 0
         
-#         adv_outputs = fmodel(adversarial)
-#         _, adv_predicted = torch.max(adv_outputs, 1)
-#         adv_accuracy = (adv_predicted == labels).float().mean().item() * 100
+        for batch_idx, (data, target) in enumerate(test_loader):
+            if args.start_batch != -1 and batch_idx < args.start_batch:
+                continue
+            if args.end_batch != -1 and batch_idx >= args.end_batch:
+                break
+                
+            data, target = data.to(device), target.to(device)
+            
+            # Skip if epsilon is 0 (clean accuracy)
+            if epsilon == 0.0:
+                with torch.no_grad():
+                    pred = model.classify(data)
+                    correct += (pred == target).sum().item()
+                    total += target.size(0)
+            else:
+                # Generate adversarial examples
+                try:
+                    _, adversarials, success = attack(fmodel, data, target, epsilons=epsilon)
+                    
+                    # Evaluate on adversarial examples
+                    with torch.no_grad():
+                        pred = model.classify(adversarials)
+                        correct += (pred == target).sum().item()
+                        total += target.size(0)
+                        
+                except Exception as e:
+                    print(f"Error in attack for epsilon {epsilon}: {e}")
+                    continue
+            
+            if args.debug and batch_idx % 10 == 0:
+                current_acc = 100. * correct / total if total > 0 else 0
+                print(f"Batch {batch_idx}, Current accuracy: {current_acc:.2f}%")
         
-#         record_results(model_name, "Linf", eps, adv_accuracy)
-#         print(f"L-inf eps {eps}: Adversarial accuracy = {adv_accuracy:.2f}%")
+        if total > 0:
+            accuracy = 100. * correct / total
+            epsilon_results[epsilon] = accuracy
+            print(f"Epsilon {epsilon}: Accuracy = {accuracy:.2f}%")
+            
+            # Record results
+            record_results("JEM", f"{distance_type}-PGD", epsilon, accuracy)
+        else:
+            print(f"No samples processed for epsilon {epsilon}")
+    
+    return epsilon_results
 
-#     # L2 PGD attack
-#     print(f"\nL2 PGD Attack Results on {model_name} Model:")
-#     for eps in l2_epsilons:
-#         _, adversarial, success = l2_attack(fmodel, images, labels, epsilons=eps)
-        
-#         adv_outputs = fmodel(adversarial)
-#         _, adv_predicted = torch.max(adv_outputs, 1)
-#         adv_accuracy = (adv_predicted == labels).float().mean().item() * 100
-        
-#         record_results(model_name, "L2", eps, adv_accuracy)
-#         print(f"L2 eps {eps}: Adversarial accuracy = {adv_accuracy:.2f}%")
+# Main evaluation
+print("="*50)
+print("ADVERSARIAL ROBUSTNESS EVALUATION")
+print("="*50)
 
-# run_attacks(fmodel_baseline, "baseline", images, labels, sampling_steps=None)
-# run_attacks(fmodel_jem0, "jem-0", images, labels)
-# run_attacks(fmodel_jem1, "jem-1", images, labels, sampling_steps=1)
-# run_attacks(fmodel_jem10, "jem-10", images, labels, sampling_steps=10)
+# Evaluate clean accuracy
+clean_acc = evaluate_clean_accuracy(model, test_loader, device)
+record_results("JEM", "Clean", 0.0, clean_acc)
 
-# df = pd.DataFrame(results)
+# Run L-infinity attacks
+if args.distance == 'Linf' or args.distance == 'both':
+    linf_results = run_adversarial_attacks(model, test_loader, device, 'Linf')
 
-# # Save results to CSV
-# df.to_csv('adversarial_robustness_results.csv', index=False)
-# print("Results saved to 'adversarial_robustness_results.csv'")
+# Run L2 attacks
+if args.distance == 'L2' or args.distance == 'both':
+    l2_results = run_adversarial_attacks(model, test_loader, device, 'L2')
 
+# Create and save results DataFrame
+results_df = pd.DataFrame(results)
+print("\n" + "="*50)
+print("FINAL RESULTS")
+print("="*50)
+print(results_df.to_string(index=False))
 
+# Save results
+os.makedirs(args.base_dir, exist_ok=True)
+results_path = os.path.join(args.base_dir, f"{args.exp_name}_adversarial_results.csv")
+results_df.to_csv(results_path, index=False)
+print(f"\nResults saved to: {results_path}")
 
-# print('Starting...')
-# for i, (img, label) in enumerate(test_loader):
-#     adversaries = []
-#     if i < args.start_batch:
-#         continue
-#     if i >= args.end_batch:
-#       break
-#     img = img.data.cpu().numpy()
-#     logits = model_wrapped(torch.from_numpy(img[:, :, :, :]).to(device))
-#     _, top = torch.topk(logits,k=2,dim=1)
-#     top = top.data.cpu().numpy()
-#     pred = top[:,0]
-#     for k in range(len(label)):
-#       im = img[k,:,:,:]
-#       orig_label = label[k].data.cpu().numpy()
-#       if pred[k] != orig_label:
-#         continue
-#       best_adv = None
-#       for ii in range(20):
-#           try:
-#             adversarial = attack(im, label=orig_label, unpack=False, random_start=True, iterations=args.n_steps_pgd_attack) 
-#             if ii == 0 or best_adv.distance > adversarial.distance:
-#                 best_adv = adversarial
-#           except:
-#             continue
-#       try:
-#           adversaries.append((im, orig_label, adversarial.image, adversarial.adversarial_class))
-#       except:
-#           continue
-#     adv_save_dir = os.path.join('adversarial_testing')
-#     save_file = 'adversarials_batch_'+str(i)
-#     if not os.path.exists(os.path.join(adv_save_dir,save_file)):
-#         os.makedirs(os.path.join(adv_save_dir,save_file))
-#     np.save(os.path.join(adv_save_dir,save_file),adversaries)
+# Print summary statistics
+print("\n" + "="*30)
+print("SUMMARY STATISTICS")
+print("="*30)
+
+for attack_type in results_df['Attack'].unique():
+    if attack_type != 'Clean':
+        attack_results = results_df[results_df['Attack'] == attack_type]
+        print(f"\n{attack_type} Attack:")
+        print(f"  Max epsilon tested: {attack_results['Epsilon'].max()}")
+        print(f"  Accuracy at max epsilon: {attack_results['Adversarial Accuracy (%)'].min():.2f}%")
+        print(f"  Accuracy drop from clean: {clean_acc - attack_results['Adversarial Accuracy (%)'].min():.2f}%")
