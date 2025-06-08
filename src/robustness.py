@@ -103,29 +103,67 @@ class CCF(EnergyModel):
         else:
             return torch.gather(logits, 1, y[:, None])
 
+# Baseline CNN model (standard CNN without JEM)
+class BaselineCNN(nn.Module):
+    def __init__(self, out_dim=10):
+        super(BaselineCNN, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=5)
+        self.conv2 = nn.Conv2d(32, 32, kernel_size=5)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=5)
+        self.fc1 = nn.Linear(3*3*64, 256)
+        self.fc2 = nn.Linear(256, out_dim)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(F.max_pool2d(self.conv2(x), 2))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu(F.max_pool2d(self.conv3(x), 2))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = x.view(-1, 3*3*64)
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, training=self.training)
+        logits = self.fc2(x)
+        return logits
+    
+    def classify(self, x):
+        logits = self.forward(x)
+        pred = logits.max(1)[1]
+        return pred
 
 class gradient_attack_wrapper(nn.Module):
-  def __init__(self, model):
-    super(gradient_attack_wrapper, self).__init__()
-    self.model = model.eval()
+    def __init__(self, model, is_baseline=False):
+        super(gradient_attack_wrapper, self).__init__()
+        self.model = model.eval()
+        self.is_baseline = is_baseline
 
-  def forward(self, x):
-    x.requires_grad_()
-    out = self.model.refined_logits(x)
-    return out
+    def forward(self, x):
+        x.requires_grad_()
+        if self.is_baseline:
+            out = self.model(x)
+        else:
+            out = self.model.refined_logits(x)
+        return out
 
-  def eval(self):
-    return self.model.eval()
+    def eval(self):
+        return self.model.eval()
 
 class DummyModel(nn.Module):
-    def __init__(self, f):
+    def __init__(self, f, n_steps_refine=0):
         super(DummyModel, self).__init__()
         self.f = f
+        self.n_steps_refine = n_steps_refine
 
     def logits(self, x):
         return self.f.classify(x)
 
-    def refined_logits(self, x, n_steps=args.n_steps_refine):
+    def refined_logits(self, x, n_steps=None):
+        if n_steps is None:
+            n_steps = self.n_steps_refine
+            
+        if n_steps == 0:
+            # No refinement, just return logits
+            return self.logits(x)
+            
         xs = x.size()
         dup_x = x.view(xs[0], 1, xs[1], xs[2], xs[3]).repeat(1, args.n_dup_chains, 1, 1, 1)
         dup_x = dup_x.view(xs[0] * args.n_dup_chains, xs[1], xs[2], xs[3])
@@ -137,7 +175,10 @@ class DummyModel(nn.Module):
         return logits
 
     def classify(self, x):
-        logits = self.logits(x)
+        if self.n_steps_refine == 0:
+            logits = self.logits(x)
+        else:
+            logits = self.refined_logits(x)
         pred = logits.max(1)[1]
         return pred
 
@@ -145,8 +186,11 @@ class DummyModel(nn.Module):
         # unnormalized logprob, unconditional on class
         return self.f(x)
 
-    def refine(self, x, n_steps=args.n_steps_refine, detach=True):
-        # runs a markov chain seeded at x, use n_steps=10
+    def refine(self, x, n_steps=None, detach=True):
+        if n_steps is None:
+            n_steps = self.n_steps_refine
+            
+        # runs a markov chain seeded at x
         x_k = torch.autograd.Variable(x, requires_grad=True) if detach else x
         # sgld
         for k in range(n_steps):
@@ -161,29 +205,18 @@ class DummyModel(nn.Module):
         grad = f_prime.view(x.size(0), -1)
         return grad.norm(p=2, dim=1)
 
-    def logpx_delta_score(self, x, n_steps=args.n_steps_refine):
+    def logpx_delta_score(self, x, n_steps=None):
+        if n_steps is None:
+            n_steps = self.n_steps_refine
+            
         # difference in logprobs from input x and samples from a markov chain seeded at x
-        #
         init_scores = self.f(x)
         x_r = self.refine(x, n_steps=n_steps)
         final_scores = self.f(x_r)
-        # for real data final_score is only slightly higher than init_score
         return init_scores - final_scores
 
     def logp_grad_score(self, x):
         return -self.grad_norm(x)
-
-# Load model
-dict = torch.load('mnist-run-4.pth', map_location=device)
-print("Model loaded with keys:", dict.keys())
-
-f = CCF()
-print("Loading model weights...")
-f.load_state_dict(torch.load('mnist-run-4.pth', map_location=device))
-
-f = DummyModel(f)
-model = f.to(device)
-model.eval()
 
 # Load the test dataset
 test_dataset = MNIST(root='./data', train=False, download=True,
@@ -200,10 +233,12 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
 # Function to evaluate clean accuracy
-def evaluate_clean_accuracy(model, test_loader, device):
+def evaluate_clean_accuracy(model, test_loader, device, model_name, is_baseline=False):
     correct = 0
     total = 0
     model.eval()
+    
+    print(f"\nEvaluating clean accuracy for {model_name}...")
     
     with torch.no_grad():
         for batch_idx, (data, target) in enumerate(test_loader):
@@ -215,20 +250,23 @@ def evaluate_clean_accuracy(model, test_loader, device):
             data, target = data.to(device), target.to(device)
             
             # Get predictions
-            pred = model.classify(data)
+            if is_baseline:
+                pred = model.classify(data)
+            else:
+                pred = model.classify(data)
             correct += (pred == target).sum().item()
             total += target.size(0)
     
     accuracy = 100. * correct / total
-    print(f"Clean accuracy: {accuracy:.2f}%")
+    print(f"{model_name} clean accuracy: {accuracy:.2f}%")
     return accuracy
 
 # Function to run adversarial attacks
-def run_adversarial_attacks(model, test_loader, device, distance_type='Linf'):
-    print(f"\nRunning {distance_type} attacks...")
+def run_adversarial_attacks(model, test_loader, device, model_name, distance_type='Linf', is_baseline=False):
+    print(f"\nRunning {distance_type} attacks on {model_name}...")
     
     # Wrap model for Foolbox
-    model_wrapped = gradient_attack_wrapper(model)
+    model_wrapped = gradient_attack_wrapper(model, is_baseline=is_baseline)
     fmodel = fb.models.PyTorchModel(model_wrapped, bounds=(-1., 1.), device=device)
     
     # Define epsilon values to test
@@ -249,7 +287,7 @@ def run_adversarial_attacks(model, test_loader, device, distance_type='Linf'):
     epsilon_results = {}
     
     for epsilon in epsilons:
-        print(f"\nTesting epsilon = {epsilon}")
+        print(f"  Testing epsilon = {epsilon}")
         correct = 0
         total = 0
         
@@ -264,7 +302,10 @@ def run_adversarial_attacks(model, test_loader, device, distance_type='Linf'):
             # Skip if epsilon is 0 (clean accuracy)
             if epsilon == 0.0:
                 with torch.no_grad():
-                    pred = model.classify(data)
+                    if is_baseline:
+                        pred = model.classify(data)
+                    else:
+                        pred = model.classify(data)
                     correct += (pred == target).sum().item()
                     total += target.size(0)
             else:
@@ -274,69 +315,146 @@ def run_adversarial_attacks(model, test_loader, device, distance_type='Linf'):
                     
                     # Evaluate on adversarial examples
                     with torch.no_grad():
-                        pred = model.classify(adversarials)
+                        if is_baseline:
+                            pred = model.classify(adversarials)
+                        else:
+                            pred = model.classify(adversarials)
                         correct += (pred == target).sum().item()
                         total += target.size(0)
                         
                 except Exception as e:
-                    print(f"Error in attack for epsilon {epsilon}: {e}")
+                    print(f"    Error in attack for epsilon {epsilon}: {e}")
                     continue
             
             if args.debug and batch_idx % 10 == 0:
                 current_acc = 100. * correct / total if total > 0 else 0
-                print(f"Batch {batch_idx}, Current accuracy: {current_acc:.2f}%")
+                print(f"    Batch {batch_idx}, Current accuracy: {current_acc:.2f}%")
         
         if total > 0:
             accuracy = 100. * correct / total
             epsilon_results[epsilon] = accuracy
-            print(f"Epsilon {epsilon}: Accuracy = {accuracy:.2f}%")
+            print(f"  Epsilon {epsilon}: Accuracy = {accuracy:.2f}%")
             
             # Record results
-            record_results("JEM", f"{distance_type}-PGD", epsilon, accuracy)
+            record_results(model_name, f"{distance_type}-PGD", epsilon, accuracy)
         else:
-            print(f"No samples processed for epsilon {epsilon}")
+            print(f"  No samples processed for epsilon {epsilon}")
     
     return epsilon_results
+
+def load_and_create_models():
+    """Load the trained models and create different configurations"""
+    models = {}
+    
+    # 1. Baseline CNN (separate trained model)
+    print("Loading baseline CNN model...")
+    try:
+        baseline_model = BaselineCNN(out_dim=10)
+        baseline_model.load_state_dict(torch.load('baseline_model.pth', map_location=device))
+        baseline_model = baseline_model.to(device)
+        baseline_model.eval()
+        models['Baseline CNN'] = (baseline_model, True)  # True indicates it's baseline
+        print("✓ Baseline CNN loaded successfully")
+    except FileNotFoundError:
+        print("✗ baseline_model.pth not found. Skipping baseline CNN.")
+    except Exception as e:
+        print(f"✗ Error loading baseline CNN: {e}")
+    
+    # 2-4. JEM models with different refinement steps
+    print("Loading trained JEM model...")
+    try:
+        ccf_model = CCF()
+        ccf_model.load_state_dict(torch.load('mnist-run-4.pth', map_location=device))
+        ccf_model = ccf_model.to(device)
+        ccf_model.eval()
+        
+        # JEM with 0 refinement steps
+        jem_0 = DummyModel(ccf_model, n_steps_refine=0)
+        models['JEM (0 steps)'] = (jem_0, False)
+        
+        # JEM with 1 refinement step
+        jem_1 = DummyModel(ccf_model, n_steps_refine=1)
+        models['JEM (1 step)'] = (jem_1, False)
+        
+        # JEM with 10 refinement steps
+        jem_10 = DummyModel(ccf_model, n_steps_refine=10)
+        models['JEM (10 steps)'] = (jem_10, False)
+        
+        print("✓ JEM models loaded successfully")
+        
+    except FileNotFoundError:
+        print("✗ mnist-run-4.pth not found. Skipping JEM models.")
+    except Exception as e:
+        print(f"✗ Error loading JEM models: {e}")
+    
+    if not models:
+        raise ValueError("No models could be loaded. Please check your model files.")
+        
+    return models
 
 # Main evaluation
 print("="*50)
 print("ADVERSARIAL ROBUSTNESS EVALUATION")
 print("="*50)
 
-# Evaluate clean accuracy
-clean_acc = evaluate_clean_accuracy(model, test_loader, device)
-record_results("JEM", "Clean", 0.0, clean_acc)
+# Load and create all model configurations
+models = load_and_create_models()
 
-# Run L-infinity attacks
-if args.distance == 'Linf' or args.distance == 'both':
-    linf_results = run_adversarial_attacks(model, test_loader, device, 'Linf')
-
-# Run L2 attacks
-if args.distance == 'L2' or args.distance == 'both':
-    l2_results = run_adversarial_attacks(model, test_loader, device, 'L2')
+# Test each model configuration
+for model_name, (model, is_baseline) in models.items():
+    print(f"\n{'='*20} {model_name} {'='*20}")
+    
+    # Evaluate clean accuracy
+    clean_acc = evaluate_clean_accuracy(model, test_loader, device, model_name, is_baseline)
+    record_results(model_name, "Clean", 0.0, clean_acc)
+    
+    # Run L-infinity attacks
+    if args.distance == 'Linf' or args.distance == 'both':
+        linf_results = run_adversarial_attacks(model, test_loader, device, model_name, 'Linf', is_baseline)
+    
+    # Run L2 attacks
+    if args.distance == 'L2' or args.distance == 'both':
+        l2_results = run_adversarial_attacks(model, test_loader, device, model_name, 'L2', is_baseline)
 
 # Create and save results DataFrame
 results_df = pd.DataFrame(results)
-print("\n" + "="*50)
+print("\n" + "="*80)
 print("FINAL RESULTS")
-print("="*50)
+print("="*80)
 print(results_df.to_string(index=False))
 
 # Save results
 os.makedirs(args.base_dir, exist_ok=True)
-results_path = os.path.join(args.base_dir, f"{args.exp_name}_adversarial_results.csv")
+results_path = os.path.join(args.base_dir, f"{args.exp_name}_comparative_adversarial_results.csv")
 results_df.to_csv(results_path, index=False)
 print(f"\nResults saved to: {results_path}")
 
-# Print summary statistics
-print("\n" + "="*30)
-print("SUMMARY STATISTICS")
-print("="*30)
+# Print comparative analysis
+print("\n" + "="*50)
+print("COMPARATIVE ANALYSIS")
+print("="*50)
 
-for attack_type in results_df['Attack'].unique():
-    if attack_type != 'Clean':
-        attack_results = results_df[results_df['Attack'] == attack_type]
-        print(f"\n{attack_type} Attack:")
-        print(f"  Max epsilon tested: {attack_results['Epsilon'].max()}")
-        print(f"  Accuracy at max epsilon: {attack_results['Adversarial Accuracy (%)'].min():.2f}%")
-        print(f"  Accuracy drop from clean: {clean_acc - attack_results['Adversarial Accuracy (%)'].min():.2f}%")
+# Group results by attack type and epsilon for comparison
+attack_types = results_df[results_df['Attack'] != 'Clean']['Attack'].unique()
+
+for attack_type in attack_types:
+    print(f"\n{attack_type} Attack Comparison:")
+    attack_data = results_df[results_df['Attack'] == attack_type]
+    
+    # Create pivot table for easy comparison
+    pivot = attack_data.pivot(index='Epsilon', columns='Model', values='Adversarial Accuracy (%)')
+    print(pivot.to_string())
+    
+    # Find best performing model at highest epsilon
+    max_epsilon = attack_data['Epsilon'].max()
+    max_eps_data = attack_data[attack_data['Epsilon'] == max_epsilon]
+    best_model = max_eps_data.loc[max_eps_data['Adversarial Accuracy (%)'].idxmax(), 'Model']
+    best_acc = max_eps_data['Adversarial Accuracy (%)'].max()
+    
+    print(f"\nBest performing model at epsilon {max_epsilon}: {best_model} ({best_acc:.2f}%)")
+
+# Print clean accuracy comparison
+print(f"\nClean Accuracy Comparison:")
+clean_data = results_df[results_df['Attack'] == 'Clean']
+for _, row in clean_data.iterrows():
+    print(f"  {row['Model']}: {row['Adversarial Accuracy (%)']:.2f}%")
