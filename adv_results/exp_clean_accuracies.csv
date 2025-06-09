@@ -1,0 +1,6 @@
+Model,Clean Accuracy (%)
+Baseline CNN,99.2
+JEM (0 steps),94.8
+JEM (1 step),94.8
+JEM (10 steps),94.8
+JEM (25 steps),94.8

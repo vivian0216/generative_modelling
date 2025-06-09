@@ -1,11 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 import random 
 import wandb
 import matplotlib.pyplot as plt
-import torch.nn.functional as F
 import os
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -82,18 +82,16 @@ def train(model: nn.Module,
             x = x.to(device)
             y = y.to(device)
             
-            # get classification loss
-            x_logits = model(x)
+            # get classification loss using the classify method
+            x_logits = model.classify(x)
             loss_clf = criterion_clf(x_logits, y)
 
             # sample starting x from buffer
             xt = torch.empty_like(x)
             for i in range(x.shape[0]):
                 if len(buffer) == 0 or np.random.random() < reinit_freq:
-                    # get a new sample in range [-1, 1)
                     xt[i] = torch.rand(x.shape[1:]) * 2 - 1
                 else:
-                    # Sample from buffer more carefully
                     buffer_batch = random.choice(buffer)
                     idx = np.random.randint(buffer_batch.shape[0])
                     xt[i] = buffer_batch[idx].clone()
@@ -101,17 +99,14 @@ def train(model: nn.Module,
             # perform SGLD with gradient clipping to prevent explosions
             for t in range(steps):
                 xt = xt.clone().detach().requires_grad_(True).to(device)
-                xt_logits = model(xt)
-                logsumexp = torch.logsumexp(xt_logits, dim=-1)
+                # Use the JEM forward method to get energy (logsumexp of logits)
+                energy = model(xt)
                 
                 # compute gradients
-                logsumexp.sum().backward()
+                energy.sum().backward()
                 
-                # Clip gradients to prevent extreme values - FIX APPLIED HERE
+                # Clip gradients to prevent extreme values
                 grad = xt.grad
-                
-                # Calculate the norm properly across all dimensions except batch
-                # For CIFAR (B, 3, 32, 32) or MNIST (B, 1, 28, 28)
                 grad_norm = torch.norm(grad.view(grad.shape[0], -1), dim=1)
                 
                 # Reshape gradient norm to match batch dimension for comparison
@@ -122,26 +117,18 @@ def train(model: nn.Module,
                 
                 # Apply the mask and rescale gradients
                 if too_large.any():
-                    # The mask broadcasting will now work correctly
                     scale_factor = 10.0 / grad_norm
                     scale_factor[~too_large] = 1.0
                     grad = grad * scale_factor
 
-                # do step manually with gradient clipping
                 with torch.no_grad():
                     xt = xt + step_size * grad + noise * torch.randn_like(xt)
-                    # Ensure xt stays in valid range to prevent extreme values
                     xt.clamp_(-1.0, 1.0)
 
-            # get generation loss with safeguards
-            xt_logits = model(xt.to(device))
-            
-            # Apply numerical stability tricks
-            x_logsumexp = torch.logsumexp(x_logits, dim=-1)
-            xt_logsumexp = torch.logsumexp(xt_logits, dim=-1)
-            
-            # Clip values to prevent extreme differences
-            diff = xt_logsumexp - x_logsumexp
+
+            x_energy = model(x)
+            xt_energy = model(xt.to(device))
+            diff = xt_energy - x_energy
             diff = torch.clamp(diff, -100, 100)
             loss_gen = diff.mean()
             
@@ -166,22 +153,18 @@ def train(model: nn.Module,
                 # Load last checkpoint and skip to next batch
                 model.load_state_dict(torch.load(model_path, weights_only=True))
                 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-                
-                # Skip this batch and continue with the next one
+
                 continue
 
-            # do model step using optimizer
             optimizer.zero_grad()
             loss.backward()
             
-            # Add gradient clipping to the model parameters
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             
             optimizer.step()
 
-            # add xt to buffer more safely
+            # add xt to buffer
             with torch.no_grad():
-                # Ensure we're adding properly clamped values
                 xt_safe = xt.detach().cpu().clamp(-1.0, 1.0)
                 buffer.append(xt_safe)
                 if len(buffer) > (buffer_size / batch_size):
@@ -192,8 +175,8 @@ def train(model: nn.Module,
             gen_losses.append(loss_gen.item())
             combined_losses.append(loss.item())
             accs.append((torch.argmax(x_logits, dim=-1) == y).detach().cpu().numpy().mean())
-            energies_real.append(-x_logsumexp.mean().item())
-            energies_fake.append(-xt_logsumexp.mean().item())
+            energies_real.append(-x_energy.mean().item())
+            energies_fake.append(-xt_energy.mean().item())
 
             pbar.set_postfix({
                 'clf_loss': np.mean(clf_losses[-50:]),  # Show average of last 50 batches
@@ -221,20 +204,13 @@ def train(model: nn.Module,
                     for ax in axs:
                         ax.clear()
                     
-                    # Handle visualization for both MNIST and CIFAR-10
+                    # Handle visualization for MNIST
                     x_np = x[0].detach().cpu().numpy()
                     xt_np = xt[0].detach().cpu().numpy()
                     
-                    # Check image dimensions to determine dataset
-                    if x_np.shape[0] == 1:  # MNIST (1x28x28)
-                        axs[0].imshow(x_np.reshape(28, 28), cmap='gray')
-                        axs[1].imshow(xt_np.reshape(28, 28), cmap='gray')
-                    elif x_np.shape[0] == 3:  # CIFAR-10 (3x32x32)
-                        # Transpose from (C,H,W) to (H,W,C) for plotting and clip to valid range
-                        axs[0].imshow(np.clip(np.transpose(x_np, (1, 2, 0)) * 0.5 + 0.5, 0, 1))
-                        axs[1].imshow(np.clip(np.transpose(xt_np, (1, 2, 0)) * 0.5 + 0.5, 0, 1))
-                    else:
-                        print(f"Unexpected image shape: {x_np.shape}")
+                    # MNIST (1x28x28)
+                    axs[0].imshow(x_np.reshape(28, 28), cmap='gray')
+                    axs[1].imshow(xt_np.reshape(28, 28), cmap='gray')
                     
                     axs[0].set_title(f'True Y: {y[0].detach().cpu().numpy()}, predicted: {torch.argmax(x_logits[0], dim=-1).detach().cpu().numpy()}, energy: {energies_real[-1]:.2f}')
                     axs[1].set_title(f'Generated sample, energy: {energies_fake[-1]:.2f}')
@@ -285,7 +261,7 @@ def train(model: nn.Module,
             for x, y in tqdm(test_dataloader, unit='batch', desc=f'Testing Epoch {e+1}'):
                 x = x.to(device)
                 y = y.to(device)
-                x_logits = model(x)
+                x_logits = model.classify(x)  # Use classify method for testing
                 test_accs.append((torch.argmax(x_logits, dim=-1) == y).detach().cpu().numpy().mean())
 
         # log metrics
@@ -302,56 +278,75 @@ def train(model: nn.Module,
             'epoch': e
         })
         e += 1
+        model.train()
 
     # Save final model
-    model_path = f'{model_dir}/final_mnist_from_train2.pth'
+    model_path = f'{model_dir}/jem_model_final.pth'
     torch.save(model.state_dict(), model_path)
-    print(f'Saved final model to {os.path.abspath(model_path)}')
+    print(f'Saved final JEM model to {os.path.abspath(model_path)}')
+
 
 class CNN(nn.Module):
     def __init__(self, out_dim):
         super(CNN, self).__init__()
         self.conv1 = nn.Conv2d(1, 32, kernel_size=5)
         self.conv2 = nn.Conv2d(32, 32, kernel_size=5)
-        self.conv3 = nn.Conv2d(32,64, kernel_size=5)
+        self.conv3 = nn.Conv2d(32, 64, kernel_size=5)
         self.fc1 = nn.Linear(3*3*64, 256)
         self.fc2 = nn.Linear(256, out_dim)
 
-    def forward(self, x):
+        self.last_dim = out_dim
+
+    def forward(self, x, return_features=False):
         x = F.relu(self.conv1(x))
-        #x = F.dropout(x, p=0.5, training=self.training)
         x = F.relu(F.max_pool2d(self.conv2(x), 2))
         x = F.dropout(x, p=0.5, training=self.training)
-        x = F.relu(F.max_pool2d(self.conv3(x),2))
+        x = F.relu(F.max_pool2d(self.conv3(x), 2))
         x = F.dropout(x, p=0.5, training=self.training)
-        x = x.view(-1,3*3*64 )
+        x = x.view(-1, 3*3*64)
         x = F.relu(self.fc1(x))
         x = F.dropout(x, training=self.training)
-        x = self.fc2(x)
-        return x
 
-class WideResNet(nn.Module):
-    def __init__(self, out_dim):
-        super(WideResNet, self).__init__()
-        self.model = models.wide_resnet50_2(pretrained=True)
-        self.model.fc = nn.Linear(self.model.fc.in_features, out_dim)
+        features = x
+        logits = self.fc2(features)
 
-    def forward(self, x):
-        # Handle different input channels for MNIST (1) vs CIFAR (3)
-        if x.shape[1] == 1:
-            x = x.repeat(1, 3, 1, 1)  # Repeat grayscale channel to make 3 channels
-        return self.model(x)
+        if return_features:
+            return features, logits
+        return logits
+
+class JEMModel(nn.Module):
+    def __init__(self, out_dim=10):
+        super(JEMModel, self).__init__()
+        self.f = CNN(out_dim)
+        self.energy_output = nn.Linear(256, 1)
+        self.class_output = nn.Linear(256, out_dim)
+
+    def forward(self, x, y=None):
+        features, _ = self.f(x, return_features=True)
+        return self.energy_output(features).squeeze()
+
+    def classify(self, x):
+        features, _ = self.f(x, return_features=True)
+        return self.class_output(features)
+
+class CCF(JEMModel):
+    def __init__(self):
+        super(CCF, self).__init__(out_dim=10)
+
+    def forward(self, x, y=None):
+        logits = self.classify(x)
+        if y is None:
+            return logits.logsumexp(1)
+        else:
+            return torch.gather(logits, 1, y[:, None])
 
 if __name__ == "__main__":
 
-    from torchvision.datasets import MNIST, CIFAR10
+    from torchvision.datasets import MNIST
     from torchvision import transforms
-    from torchvision import models
     import argparse
 
     parser = argparse.ArgumentParser(description='JEM Training')
-    parser.add_argument('--dataset', type=str, default='mnist', choices=['mnist', 'cifar10'],
-                        help='dataset to use (default: mnist)')
     parser.add_argument('--verbose', action='store_true', 
                         help='Enable verbose output with sample visualizations')
     args = parser.parse_args()
@@ -360,68 +355,36 @@ if __name__ == "__main__":
     if args.verbose:
         verbose_interval = 650  # Show samples every _ batches
     
-    if args.dataset == 'mnist':
-        print("Using MNIST dataset")
-        full_dataset = MNIST(root='./data', train=True, download=True, transform=transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x * 2 - 1)
-        ]))
-        test_full_dataset = MNIST(root='./data', train=False, download=True, transform=transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x * 2 - 1)
-        ]))
-        input_channels = 1
-    else:
-        print("Using CIFAR10 dataset")
-        full_dataset = CIFAR10(root='./data', train=True, download=True, transform=transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x * 2 - 1)
-        ]))
-        test_full_dataset = CIFAR10(root='./data', train=False, download=True, transform=transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Lambda(lambda x: x * 2 - 1)
-        ]))
-        input_channels = 3
+    print("Using MNIST dataset")
+    full_dataset = MNIST(root='./data', train=True, download=True, transform=transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x * 2 - 1)
+    ]))
+    test_full_dataset = MNIST(root='./data', train=False, download=True, transform=transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x * 2 - 1)
+    ]))
 
     out_dim = 10
     
-    # Model selection based on dataset
-    if args.dataset == 'mnist':
-        model = CNN(out_dim)  # CNN works well for MNIST
-    else:
-        model = WideResNet(out_dim)  # WideResNet better for CIFAR
+    # Use JEM wrapper for CNN
+    model = CCF()
 
-    # Configure dataset-specific hyperparameters
-    if args.dataset == 'mnist':
-        cfg = dict(
-            step_size = 0.5,  # Lower step size for MNIST
-            noise = 0.01, 
-            buffer_size = 1000,
-            steps = 20,
-            reinit_freq = 0.05,
-            epochs = 50,
-            batch_size = 50,
-            learning_rate = 1e-4,
-            gen_weight = 1,  # Lower gen_weight for stability
-            learning_rate_decay = 0.3,
-            learning_rate_epochs = 50,
-            data_fraction = 1.0,  # Use full training set
-        )
-    else:
-        cfg = dict(
-            step_size = 0.25,  # Lower step size for CIFAR
-            noise = 0.005,  # Lower noise for CIFAR
-            buffer_size = 1000,
-            steps = 20,
-            reinit_freq = 0.05,
-            epochs = 150,
-            batch_size = 40,  # Smaller batch size due to complexity
-            learning_rate = 5e-5,  # Lower learning rate for stability
-            gen_weight = 0.1,  # Start with much lower gen_weight for stability
-            learning_rate_decay = 0.3,
-            learning_rate_epochs = 50,
-            data_fraction = 0.5,  # Use less data initially for faster iteration
-        )
+    # Configure hyperparameters for MNIST
+    cfg = dict(
+        step_size = 0.5,
+        noise = 0.01, 
+        buffer_size = 1000,
+        steps = 20,
+        reinit_freq = 0.05,
+        epochs = 20,
+        batch_size = 50,
+        learning_rate = 1e-4,
+        gen_weight = 1,
+        learning_rate_decay = 0.3,
+        learning_rate_epochs = 20,
+        data_fraction = 1.0,
+    )
         
     # Use a subset of the dataset if specified
     data_fraction = cfg.pop('data_fraction')
@@ -437,7 +400,7 @@ if __name__ == "__main__":
     # Use the full test dataset
     test_dataset = test_full_dataset
     
-    wandb.init(project=f"jem-{args.dataset}", config=cfg)
+    wandb.init(project=f"jem-mnist", config=cfg)
 
     train(model = model,
           train_dataset = train_dataset,

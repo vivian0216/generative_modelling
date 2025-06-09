@@ -1,0 +1,10 @@
+Model,Attack,Epsilon,Adversarial Accuracy (%)
+JEM,Clean,0.0,94.8
+JEM,Linf-PGD,0.0,94.8
+JEM,Linf-PGD,0.01,94.6
+JEM,Linf-PGD,0.03,93.4
+JEM,Linf-PGD,0.05,92.5
+JEM,Linf-PGD,0.1,88.9
+JEM,Linf-PGD,0.15,83.5
+JEM,Linf-PGD,0.2,75.2
+JEM,Linf-PGD,0.3,45.5
