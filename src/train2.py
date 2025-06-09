@@ -90,10 +90,8 @@ def train(model: nn.Module,
             xt = torch.empty_like(x)
             for i in range(x.shape[0]):
                 if len(buffer) == 0 or np.random.random() < reinit_freq:
-                    # get a new sample in range [-1, 1)
                     xt[i] = torch.rand(x.shape[1:]) * 2 - 1
                 else:
-                    # Sample from buffer more carefully
                     buffer_batch = random.choice(buffer)
                     idx = np.random.randint(buffer_batch.shape[0])
                     xt[i] = buffer_batch[idx].clone()
@@ -107,11 +105,8 @@ def train(model: nn.Module,
                 # compute gradients
                 energy.sum().backward()
                 
-                # Clip gradients to prevent extreme values - FIX APPLIED HERE
+                # Clip gradients to prevent extreme values
                 grad = xt.grad
-                
-                # Calculate the norm properly across all dimensions except batch
-                # For CIFAR (B, 3, 32, 32) or MNIST (B, 1, 28, 28)
                 grad_norm = torch.norm(grad.view(grad.shape[0], -1), dim=1)
                 
                 # Reshape gradient norm to match batch dimension for comparison
@@ -122,23 +117,17 @@ def train(model: nn.Module,
                 
                 # Apply the mask and rescale gradients
                 if too_large.any():
-                    # The mask broadcasting will now work correctly
                     scale_factor = 10.0 / grad_norm
                     scale_factor[~too_large] = 1.0
                     grad = grad * scale_factor
 
-                # do step manually with gradient clipping
                 with torch.no_grad():
                     xt = xt + step_size * grad + noise * torch.randn_like(xt)
-                    # Ensure xt stays in valid range to prevent extreme values
                     xt.clamp_(-1.0, 1.0)
 
-            # get generation loss with safeguards
-            # Use the JEM forward method for both real and fake samples
+
             x_energy = model(x)
             xt_energy = model(xt.to(device))
-            
-            # Clip values to prevent extreme differences
             diff = xt_energy - x_energy
             diff = torch.clamp(diff, -100, 100)
             loss_gen = diff.mean()
@@ -164,22 +153,18 @@ def train(model: nn.Module,
                 # Load last checkpoint and skip to next batch
                 model.load_state_dict(torch.load(model_path, weights_only=True))
                 optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-                
-                # Skip this batch and continue with the next one
+
                 continue
 
-            # do model step using optimizer
             optimizer.zero_grad()
             loss.backward()
             
-            # Add gradient clipping to the model parameters
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             
             optimizer.step()
 
-            # add xt to buffer more safely
+            # add xt to buffer
             with torch.no_grad():
-                # Ensure we're adding properly clamped values
                 xt_safe = xt.detach().cpu().clamp(-1.0, 1.0)
                 buffer.append(xt_safe)
                 if len(buffer) > (buffer_size / batch_size):
@@ -300,7 +285,7 @@ def train(model: nn.Module,
     torch.save(model.state_dict(), model_path)
     print(f'Saved final JEM model to {os.path.abspath(model_path)}')
 
-# Define the CNN class with proper JEM structure
+
 class CNN(nn.Module):
     def __init__(self, out_dim):
         super(CNN, self).__init__()
@@ -310,7 +295,7 @@ class CNN(nn.Module):
         self.fc1 = nn.Linear(3*3*64, 256)
         self.fc2 = nn.Linear(256, out_dim)
 
-        self.last_dim = out_dim  # important for JEM to know output dim
+        self.last_dim = out_dim
 
     def forward(self, x, return_features=False):
         x = F.relu(self.conv1(x))
@@ -322,7 +307,7 @@ class CNN(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.dropout(x, training=self.training)
 
-        features = x  # penultimate features
+        features = x
         logits = self.fc2(features)
 
         if return_features:
@@ -332,8 +317,8 @@ class CNN(nn.Module):
 class JEMModel(nn.Module):
     def __init__(self, out_dim=10):
         super(JEMModel, self).__init__()
-        self.f = CNN(out_dim)  # your custom CNN
-        self.energy_output = nn.Linear(256, 1)  # use 256 = feature dim from CNN.fc1
+        self.f = CNN(out_dim)
+        self.energy_output = nn.Linear(256, 1)
         self.class_output = nn.Linear(256, out_dim)
 
     def forward(self, x, y=None):
@@ -398,7 +383,7 @@ if __name__ == "__main__":
         gen_weight = 1,
         learning_rate_decay = 0.3,
         learning_rate_epochs = 20,
-        data_fraction = 1.0,  # Use full training set
+        data_fraction = 1.0,
     )
         
     # Use a subset of the dataset if specified

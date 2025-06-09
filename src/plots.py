@@ -4,11 +4,8 @@ import numpy as np
 import os
 
 def plot_robustness_results():
-    # Set up the plot style
-    plt.style.use('default')
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
-    # Define colors for each model
     colors = {
         'Baseline CNN': '#1f77b4',
         'JEM (0 steps)': '#ff7f0e', 
@@ -17,7 +14,6 @@ def plot_robustness_results():
         'JEM (25 steps)': '#9467bd'
     }
     
-    # Define line styles for better distinction
     line_styles = {
         'Baseline CNN': '-',
         'JEM (0 steps)': '--', 
@@ -104,8 +100,5 @@ def print_summary_stats():
         print(f"Could not load results files: {e}")
 
 if __name__ == "__main__":
-    # Create the plots
     plot_robustness_results()
-    
-    # Print summary statistics
     print_summary_stats()

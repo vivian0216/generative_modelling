@@ -47,7 +47,6 @@ def record_results(model_name, attack_type, epsilon, accuracy):
         "Adversarial Accuracy (%)": round(accuracy, 2)
     })
 
-# Define the CNN class
 class CNN(nn.Module):
     def __init__(self, out_dim):
         super(CNN, self).__init__()
@@ -57,7 +56,7 @@ class CNN(nn.Module):
         self.fc1 = nn.Linear(3*3*64, 256)
         self.fc2 = nn.Linear(256, out_dim)
 
-        self.last_dim = out_dim  # important for JEM to know output dim
+        self.last_dim = out_dim 
 
     def forward(self, x, return_features=False):
         x = F.relu(self.conv1(x))
@@ -69,7 +68,7 @@ class CNN(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.dropout(x, training=self.training)
 
-        features = x  # penultimate features
+        features = x
         logits = self.fc2(features)
 
         if return_features:
@@ -79,8 +78,8 @@ class CNN(nn.Module):
 class EnergyModel(nn.Module):
     def __init__(self, out_dim=10):
         super(EnergyModel, self).__init__()
-        self.f = CNN(out_dim)  # your custom CNN
-        self.energy_output = nn.Linear(256, 1)  # use 256 = feature dim from CNN.fc1
+        self.f = CNN(out_dim)
+        self.energy_output = nn.Linear(256, 1)
         self.class_output = nn.Linear(256, out_dim)
 
     def forward(self, x, y=None):
@@ -102,7 +101,6 @@ class CCF(EnergyModel):
         else:
             return torch.gather(logits, 1, y[:, None])
 
-# Baseline CNN model (standard CNN without JEM)
 class BaselineCNN(nn.Module):
     def __init__(self, out_dim=10):
         super(BaselineCNN, self).__init__()
@@ -143,7 +141,6 @@ class DummyModel(nn.Module):
             n_steps = self.n_steps_refine
             
         if n_steps == 0:
-            # No refinement, just return logits
             return self.logits(x)
             
         xs = x.size()
@@ -197,7 +194,7 @@ class DummyModel(nn.Module):
     def logp_grad_score(self, x):
         return -self.grad_norm(x)
 
-# Custom PGD Attack Implementation
+
 class CustomPGDAttack:
     def __init__(self, model, eps, alpha, steps, norm='Linf', random_start=True, is_baseline=False):
         """
@@ -292,21 +289,19 @@ class CustomPGDAttack:
         
         return x_adv.detach()
 
-# Load the test dataset
+
 test_dataset = MNIST(root='./data', train=False, download=True,
                      transform=transforms.Compose([
                          transforms.ToTensor(),
                          transforms.Lambda(lambda x: x * 2 - 1)
                      ]))
 
-# Create test dataloader
 test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=100, shuffle=False)
 
-# Set device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-# Function to evaluate clean accuracy
+
 def evaluate_clean_accuracy(model, test_loader, device, model_name, is_baseline=False):
     correct = 0
     total = 0
@@ -323,7 +318,6 @@ def evaluate_clean_accuracy(model, test_loader, device, model_name, is_baseline=
                 
             data, target = data.to(device), target.to(device)
             
-            # Get predictions
             if is_baseline:
                 pred = model.classify(data)
             else:
@@ -335,21 +329,18 @@ def evaluate_clean_accuracy(model, test_loader, device, model_name, is_baseline=
     print(f"{model_name} clean accuracy: {accuracy:.2f}%")
     return accuracy
 
-# Function to run adversarial attacks using custom PGD
+
 def run_adversarial_attacks(model, test_loader, device, model_name, distance_type='Linf', is_baseline=False):
     print(f"\nRunning {distance_type} attacks on {model_name}...")
     
-    # Define epsilon values and step sizes
+
     if distance_type == 'L2':
         epsilons = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0]
-        # Step size as fraction of epsilon
         alpha_ratio = 0.1
     else:  # Linf
         epsilons = [0.0, 0.01, 0.03, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 1.0]
-        # Step size as fraction of epsilon
         alpha_ratio = 0.1
     
-    # Store results for each epsilon
     epsilon_results = {}
     
     for epsilon in epsilons:
@@ -360,7 +351,6 @@ def run_adversarial_attacks(model, test_loader, device, model_name, distance_typ
         # Calculate step size
         alpha = epsilon * alpha_ratio if epsilon > 0 else 0
         
-        # Create attack instance
         attack = CustomPGDAttack(
             model=model,
             eps=epsilon,
@@ -380,7 +370,6 @@ def run_adversarial_attacks(model, test_loader, device, model_name, distance_typ
             data, target = data.to(device), target.to(device)
             
             try:
-                # Generate adversarial examples
                 adv_data = attack.attack(data, target)
                 
                 # Evaluate on adversarial examples
@@ -506,7 +495,7 @@ results_path = os.path.join(args.base_dir, f"{args.exp_name}_comparative_adversa
 results_df.to_csv(results_path, index=False)
 print(f"\nComplete results saved to: {results_path}")
 
-# 2. Create separate CSV files for each norm (optimized for line plotting)
+# 2. Create separate CSV files for each norm
 attack_types = results_df[results_df['Attack'] != 'Clean']['Attack'].unique()
 
 for attack_type in attack_types:
@@ -515,7 +504,6 @@ for attack_type in attack_types:
     # Create pivot table for easy plotting
     pivot_table = attack_data.pivot(index='Epsilon', columns='Model', values='Adversarial Accuracy (%)')
     
-    # Save pivot table
     norm_name = attack_type.replace('-PGD', '')
     pivot_path = os.path.join(args.base_dir, f"{args.exp_name}_{norm_name}_results_for_plotting.csv")
     pivot_table.to_csv(pivot_path)
