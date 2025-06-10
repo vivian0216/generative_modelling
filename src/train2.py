@@ -349,6 +349,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='JEM Training')
     parser.add_argument('--verbose', action='store_true', 
                         help='Enable verbose output with sample visualizations')
+    parser.add_argument('--model', type=str, default='CCF', choices=['CNN', 'CCF'],
+                        help='Model type to use (CCF or CNN)')
     args = parser.parse_args()
 
     # Set verbose interval if flag is provided
@@ -366,25 +368,41 @@ if __name__ == "__main__":
     ]))
 
     out_dim = 10
-    
     # Use JEM wrapper for CNN
     model = CCF()
-
-    # Configure hyperparameters for MNIST
-    cfg = dict(
-        step_size = 0.5,
-        noise = 0.01, 
-        buffer_size = 1000,
-        steps = 20,
-        reinit_freq = 0.05,
-        epochs = 20,
-        batch_size = 50,
-        learning_rate = 1e-4,
-        gen_weight = 1,
-        learning_rate_decay = 0.3,
-        learning_rate_epochs = 20,
-        data_fraction = 1.0,
-    )
+    
+    if args.model == 'CNN':
+        # Base configuration so we are training the JEM model without the generative component and energy output
+        cfg = dict(
+            step_size = 0.5,
+            noise = 0.01, 
+            buffer_size = 1000,
+            steps = 0,
+            reinit_freq = 0.05,
+            epochs = 20,
+            batch_size = 50,
+            learning_rate = 1e-4,
+            gen_weight = 0,
+            learning_rate_decay = 0.3,
+            learning_rate_epochs = 20,
+            data_fraction = 1.0,
+        )
+    else:
+        # Configure hyperparameters for MNIST
+        cfg = dict(
+            step_size = 0.5,
+            noise = 0.01, 
+            buffer_size = 1000,
+            steps = 20,
+            reinit_freq = 0.05,
+            epochs = 20,
+            batch_size = 50,
+            learning_rate = 1e-4,
+            gen_weight = 1,
+            learning_rate_decay = 0.3,
+            learning_rate_epochs = 20,
+            data_fraction = 1.0,
+        )
         
     # Use a subset of the dataset if specified
     data_fraction = cfg.pop('data_fraction')
